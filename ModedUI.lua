@@ -1,5 +1,5 @@
 --[[
-	ModedUI  ·  v1.2.0
+	ModedUI  ·  v1.3.0
 	A batteries-included UI library built on Fluent by dawid-scripts
 	https://github.com/XITHHUB/ModedUI  ·  Fluent: https://github.com/dawid-scripts/Fluent
 
@@ -18,6 +18,7 @@
 	  • Rate-limited notifications (max 3 on screen) with type icons and a mute switch
 	  • Watermark (1 Hz), draggable keybind list overlay, Info and Settings tabs
 	  • Empty tabs show a "Coming Soon" card with a sad face (text and image per tab)
+	  • Hide/show and lock/unlock tabs, sections and elements (locked = dimmed, input blocked)
 	  • Element wrapper: every element is saved by its id automatically
 	  • Maid-based cleanup, double-load protection, every callback pcall'd
 
@@ -26,7 +27,7 @@
 	  6. Window     7. Tabs        8. Overlays         9. Settings       10. Init (public API)
 ]]
 
-local LIBRARY_VERSION = "1.2.0"
+local LIBRARY_VERSION = "1.3.0"
 local LIBRARY_CHUNK = debug.info(1, "f") -- lets each additional window run on a fresh library copy
 local CONFIG_VERSION = 2 -- saved file format (see MIGRATIONS in section 4)
 
@@ -129,6 +130,8 @@ local Env = {
 	getupvalues = firstFunction(debug and (debug :: any).getupvalues, getupvalues),
 	getgc = firstFunction(getgc),
 	identifyexecutor = firstFunction(identifyexecutor, getexecutorname),
+	firesignal = firstFunction(firesignal),
+	getconnections = firstFunction(getconnections, get_signal_cons),
 	CanWrite = false,
 	CanUseAssets = false,
 }
@@ -2416,30 +2419,37 @@ function Search.AddTab(tab: any, name: string): any
 		Tab = tab,
 		Label = tab.Frame and tab.Frame:FindFirstChildOfClass("TextLabel"),
 		Count = 0,
+		Hidden = false,
+		Locked = false,
 	}
 	Search.Tabs[#Search.Tabs + 1] = record
 	return record
 end
 
 function Search.AddSection(root: Instance?): any
-	local record = { Root = root, Count = 0 }
+	local record = { Root = root, Count = 0, Hidden = false, Locked = false }
 	Search.Sections[#Search.Sections + 1] = record
 	return record
 end
 
-function Search.Add(frame: GuiObject?, title: string, keywords: string?, tabRecord: any, sectionRecord: any)
+function Search.Add(frame: GuiObject?, title: string, keywords: string?, tabRecord: any, sectionRecord: any): any
 	if not frame or not tabRecord then
-		return
+		return nil
 	end
 	local text = keywords and string_format("%s %s", title, keywords) or title
-	Search.Records[#Search.Records + 1] = {
+	local record = {
 		Frame = frame,
 		Text = string_lower(text),
 		Tab = tabRecord,
 		Section = sectionRecord,
+		Hidden = false, -- :Hide() on the element
 	}
+	Search.Records[#Search.Records + 1] = record
+	return record
 end
 
+-- Also the single place that applies :Hide()/:Show(): an element is shown when it isn't hidden
+-- and matches the query; hidden tabs and sections don't count towards the results.
 function Search.Apply(raw: string?)
 	local query = string_lower(Util.Trim(tostring(raw or "")))
 	Search.Query = query
@@ -2452,23 +2462,24 @@ function Search.Apply(raw: string?)
 	end
 	local total = 0
 	for _, record in ipairs(Search.Records) do
-		local visible = not searching or string_find(record.Text, query, 1, true) ~= nil
+		local visible = not record.Hidden and (not searching or string_find(record.Text, query, 1, true) ~= nil)
 		local frame = record.Frame
 		if frame.Visible ~= visible then
 			frame.Visible = visible
 		end
-		if visible then
+		local section = record.Section
+		if visible and not record.Tab.Hidden and not (section and section.Hidden) then
 			total += 1
 			record.Tab.Count += 1
-			if record.Section then
-				record.Section.Count += 1
+			if section then
+				section.Count += 1
 			end
 		end
 	end
 	for _, section in ipairs(Search.Sections) do
 		local root = section.Root
 		if root then
-			local visible = not searching or section.Count > 0
+			local visible = not section.Hidden and (not searching or section.Count > 0)
 			if root.Visible ~= visible then
 				root.Visible = visible
 			end
@@ -2482,7 +2493,7 @@ function Search.Apply(raw: string?)
 				label.TextTransparency = 0
 			else
 				label.Text = tab.Name
-				label.TextTransparency = searching and 0.6 or 0
+				label.TextTransparency = if searching then 0.6 elseif tab.Locked then 0.45 else 0
 			end
 		end
 	end
@@ -3673,7 +3684,7 @@ local function attachEmptyState(builder: any, options: any)
 				break
 			end
 		end
-		local visible = empty and page.Visible
+		local visible = empty and page.Visible and not builder.TabRecord.Locked
 		if frame.Visible ~= visible then
 			frame.Visible = visible
 		end
@@ -3689,7 +3700,7 @@ local function attachEmptyState(builder: any, options: any)
 	App.Maid:Connect(page.ChildRemoved, update)
 	App.Maid:Connect(page:GetPropertyChangedSignal("Visible"), update)
 
-	builder.Empty = { Frame = frame, Title = title, Text = text, Icon = icon }
+	builder.Empty = { Frame = frame, Title = title, Text = text, Icon = icon, Update = update }
 	local defaults = if type(SETTINGS.EmptyTab) == "table" then SETTINGS.EmptyTab else {}
 	builder:SetEmpty(
 		options.EmptyTitle or defaults.Title,
@@ -3718,7 +3729,484 @@ function UI.Tab(title: string, icon: string?, layoutOrder: number?, options: any
 	if SETTINGS.EmptyTab ~= false and layoutOrder == nil then -- (the built-in tabs are never empty)
 		attachEmptyState(builder, if type(options) == "table" then options else {})
 	end
+	UI.Tabs[#UI.Tabs + 1] = builder
 	return builder
+end
+
+-- Hide / show / lock ----------------------------------------------------------------------------
+-- Tabs, sections and elements all get the same methods:
+--   :Hide()  :Show()  :SetVisible(bool)  :IsVisible()
+--   :Lock(reason?)  :Unlock()  :SetLocked(bool, reason?)  :IsLocked()
+-- Hiding is visual only (search skips hidden things). Locking dims the item behind an overlay
+-- that blocks mouse input (a click explains why in a toast, hovering shows the reason) and stops
+-- a locked keybind from firing. Scripts can still change locked values. Overlays are created the
+-- first time something is locked; nothing runs while states don't change.
+UI.Tabs = {} :: { any }
+Internals.TabModule = nil :: any -- Fluent's private tab module (false = unavailable)
+
+local function lockImage(): string
+	return App.Fluent:GetIcon("lock") or ""
+end
+
+local function explainLock(reason: string?)
+	Notify("Locked", if reason and reason ~= "" then reason else "This is locked for now.", 3, "Warning")
+end
+
+-- Hover text that always shows the current reason.
+local function reasonTooltip(target: GuiObject, state: any)
+	App.Maid:Connect(target.MouseEnter, function()
+		if state.Reason and state.Reason ~= "" then
+			Tooltip.Show(state.Reason)
+		end
+	end)
+	App.Maid:Connect(target.MouseLeave, Tooltip.Hide)
+	App.Maid:Connect(target.MouseMoved, function()
+		if Tooltip.Frame and Tooltip.Frame.Visible then
+			Tooltip.Move()
+		end
+	end)
+end
+
+-- A button-shaped blocker (buttons sink clicks) painted like a dimmed panel.
+local function blocker(name: string, properties: { [string]: any }, children: { Instance }, state: any): TextButton
+	local overlay = Util.Create("TextButton", {
+		Name = name,
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 0.3,
+		Visible = false,
+	}, children)
+	for key, value in pairs(properties) do
+		(overlay :: any)[key] = value
+	end
+	Win.Paint(function(palette)
+		overlay.BackgroundColor3 = palette.Panel
+		for _, child in ipairs(overlay:GetDescendants()) do
+			if child:IsA("TextLabel") then
+				child.TextColor3 = palette.Text
+			elseif child:IsA("ImageLabel") then
+				child.ImageColor3 = palette.Text
+			end
+		end
+	end)
+	App.Maid:Connect(overlay.MouseButton1Click, function()
+		explainLock(state.Reason)
+	end)
+	reasonTooltip(overlay, state)
+	return overlay
+end
+
+-- Belt and braces: besides the overlay, locked content stops receiving input at all
+-- (GuiObject.Interactable also covers drag handles that listen to InputBegan).
+local function setInteractable(target: Instance?, interactable: boolean)
+	if target and target:IsA("GuiObject") then
+		pcall(function()
+			(target :: any).Interactable = interactable
+		end)
+	end
+end
+
+local function lockRow(text: string, size: number): (Frame, TextLabel)
+	local label = Util.Create("TextLabel", {
+		BackgroundTransparency = 1,
+		FontFace = FONT_MEDIUM,
+		TextSize = 13,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2_fromOffset(0, size),
+		Text = text,
+		LayoutOrder = 2,
+	})
+	local row = Util.Create("Frame", {
+		BackgroundTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.X,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2_fromScale(0.5, 0.5),
+		Size = UDim2_fromOffset(0, size),
+	}, {
+		Util.Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim_new(0, 6),
+		}),
+		Util.Create("ImageLabel", {
+			BackgroundTransparency = 1,
+			Image = lockImage(),
+			Size = UDim2_fromOffset(size, size),
+			LayoutOrder = 1,
+		}),
+		label,
+	})
+	return row, label
+end
+
+-- Elements ------------------------------------------------------------------------------------
+local function refreshElementLock(record: any)
+	local locked = record.Locked
+	if record.Entry then
+		record.Entry.Locked = locked
+	end
+	if locked and not record.Overlay then
+		local label = Util.Create("TextLabel", {
+			BackgroundTransparency = 1,
+			FontFace = FONT_MEDIUM,
+			TextSize = 12,
+			TextTransparency = 0.15,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2_new(1, -34, 0.5, 0),
+			Size = UDim2_new(0.5, -34, 0, 14),
+		})
+		record.Overlay = blocker("LockOverlay", {
+			Size = UDim2_fromScale(1, 1),
+			ZIndex = 20,
+			BackgroundTransparency = 0.35,
+			Parent = record.Frame,
+		}, {
+			Util.Corner(4),
+			Util.Create("ImageLabel", {
+				BackgroundTransparency = 1,
+				Image = lockImage(),
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2_new(1, -12, 0.5, 0),
+				Size = UDim2_fromOffset(16, 16),
+			}),
+			label,
+		}, record)
+		record.OverlayLabel = label
+	end
+	if record.Overlay then
+		record.Overlay.Visible = locked
+		record.OverlayLabel.Text = record.Reason or ""
+		for _, child in ipairs(record.Frame:GetChildren()) do
+			if child ~= record.Overlay then
+				setInteractable(child, not locked)
+			end
+		end
+	end
+	local entry = record.Entry
+	if locked and entry and entry.Type == "Dropdown" then
+		local option = entry.Option
+		if option.Opened and type(option.Close) == "function" then
+			pcall(option.Close, option) -- don't leave its list open under the lock
+		end
+	end
+	if entry and entry.Type == "Keybind" then
+		KeybindList.Refresh()
+	end
+end
+
+-- Adds the methods to an element's object (the option, a button or a paragraph).
+function UI.Control(target: any, record: any, entry: any?)
+	if type(target) ~= "table" or not record then
+		return
+	end
+	record.Entry = entry
+	record.Locked, record.Reason = false, nil
+	function target:SetVisible(visible: boolean): any
+		record.Hidden = visible == false
+		Search.Apply(Search.Query)
+		return target
+	end
+	function target:Hide(): any
+		return target:SetVisible(false)
+	end
+	function target:Show(): any
+		return target:SetVisible(true)
+	end
+	function target:IsVisible(): boolean
+		return not record.Hidden
+	end
+	function target:SetLocked(locked: boolean, reason: string?): any
+		record.Locked = locked ~= false
+		record.Reason = if record.Locked and reason ~= nil then tostring(reason) else nil
+		refreshElementLock(record)
+		return target
+	end
+	function target:Lock(reason: string?): any
+		return target:SetLocked(true, reason)
+	end
+	function target:Unlock(): any
+		return target:SetLocked(false)
+	end
+	function target:IsLocked(): boolean
+		return record.Locked == true
+	end
+end
+
+-- Sections --------------------------------------------------------------------------------------
+local function refreshSectionLock(record: any)
+	local root = record.Root
+	if record.Locked and not record.Overlay and root then
+		local row, label = lockRow("Locked", 16)
+		record.Overlay = blocker("LockOverlay", {
+			Position = UDim2_fromOffset(0, 24),
+			Size = UDim2_new(1, 0, 1, -24),
+			ZIndex = 5,
+			BackgroundTransparency = 0.12, -- opaque enough to read the reason over the elements
+			Parent = root,
+		}, { Util.Corner(6), row }, record)
+		record.OverlayLabel = label
+	end
+	if record.Overlay then
+		record.Overlay.Visible = record.Locked
+		record.OverlayLabel.Text = record.Reason or "Locked"
+		setInteractable(record.Container, not record.Locked)
+	end
+end
+
+-- Tabs ------------------------------------------------------------------------------------------
+function Internals.ResolveTabModule(): any
+	local module = Internals.TabModule
+	if module ~= nil then
+		return module or nil
+	end
+	module = false
+	if Env.getupvalues and App.Window then
+		pcall(function()
+			for _, value in pairs(Env.getupvalues(App.Window.AddTab)) do
+				if
+					type(value) == "table"
+					and type(rawget(value, "SelectTab")) == "function"
+					and type(rawget(value, "Tabs")) == "table"
+				then
+					module = value
+					break
+				end
+			end
+		end)
+	end
+	Internals.TabModule = module
+	return module or nil
+end
+
+-- Selects a tab (Fluent's own Window:SelectTab always picks the first one).
+function UI.SelectTab(builder: any): boolean
+	local tab = builder and builder.Fluent
+	if not tab or not tab.Frame then
+		return false
+	end
+	local module = Internals.ResolveTabModule()
+	if module then
+		for index, candidate in pairs(module.Tabs) do
+			if candidate == tab then
+				module:SelectTab(index)
+				return true
+			end
+		end
+	end
+	local signal = tab.Frame.MouseButton1Click
+	if Env.firesignal then
+		return (pcall(Env.firesignal, signal))
+	elseif Env.getconnections then
+		local ok = pcall(function()
+			for _, connection in ipairs(Env.getconnections(signal)) do
+				connection:Fire()
+			end
+		end)
+		return ok
+	end
+	return false
+end
+
+-- First visible tab in on-screen order (optionally skipping one).
+function UI.FirstVisibleTab(except: any?): any
+	local best = nil
+	for _, builder in ipairs(UI.Tabs) do
+		local frame = builder.Fluent.Frame
+		if builder ~= except and not builder.TabRecord.Hidden and frame then
+			if not best or frame.LayoutOrder < best.Fluent.Frame.LayoutOrder then
+				best = builder
+			end
+		end
+	end
+	return best
+end
+
+function UI.FindTab(title: any): any
+	if type(title) == "table" then
+		return title
+	end
+	for _, builder in ipairs(UI.Tabs) do
+		if builder.TabRecord.Name == title then
+			return builder
+		end
+	end
+	return nil
+end
+
+-- Moves Fluent's selector bar back onto the selected tab after tabs above it were hidden/shown.
+function UI.SyncSelector()
+	local selector, window = Win.Selector, App.Window
+	if not selector or not window then
+		return
+	end
+	for _, builder in ipairs(UI.Tabs) do
+		local tab = builder.Fluent
+		if tab.Selected and tab.Frame then
+			local offset = tab.Frame.AbsolutePosition.Y - window.TabHolder.AbsolutePosition.Y
+			selector.Position = UDim2_new(0, 0, 0, offset + 17) -- scaled px; ScaleFix corrects it
+			return
+		end
+	end
+end
+
+local function refreshTabLock(builder: any)
+	local record = builder.TabRecord
+	local tab = builder.Fluent
+	local page = tab.ContainerFrame
+	if record.Locked and not record.Overlay and page and page.Parent then
+		local icon = Util.Create("ImageLabel", {
+			Name = "LockIcon",
+			BackgroundTransparency = 1,
+			Image = lockImage(),
+			ImageTransparency = 0.35,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2_new(1, -10, 0.5, 0),
+			Size = UDim2_fromOffset(12, 12),
+			Visible = false,
+			Parent = tab.Frame,
+		})
+		Win.Paint(function(palette)
+			icon.ImageColor3 = palette.Text
+		end)
+		local title = Util.Create("TextLabel", {
+			Name = "Heading",
+			BackgroundTransparency = 1,
+			FontFace = FONT_BOLD,
+			TextSize = 20,
+			Text = "Locked",
+			Size = UDim2_new(1, -40, 0, 26),
+			LayoutOrder = 2,
+		})
+		local text = Util.Create("TextLabel", {
+			Name = "Reason",
+			BackgroundTransparency = 1,
+			FontFace = FONT_REGULAR,
+			TextSize = 13,
+			TextTransparency = 0.35,
+			TextWrapped = true,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Size = UDim2_new(1, -60, 0, 0),
+			LayoutOrder = 3,
+		})
+		local overlay = blocker("LockedPage", {
+			Size = UDim2_fromScale(1, 1),
+			ZIndex = 3,
+			BackgroundTransparency = 0.15,
+			Parent = page.Parent,
+		}, {
+			Util.Corner(6),
+			Util.Create("UIListLayout", {
+				FillDirection = Enum.FillDirection.Vertical,
+				HorizontalAlignment = Enum.HorizontalAlignment.Center,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim_new(0, 4),
+			}),
+			Util.Create("ImageLabel", {
+				BackgroundTransparency = 1,
+				Image = lockImage(),
+				ImageTransparency = 0.2,
+				Size = UDim2_fromOffset(40, 40),
+				LayoutOrder = 1,
+			}),
+			title,
+			text,
+		}, record)
+		record.Overlay, record.OverlayText, record.TabIcon = overlay, text, icon
+		App.Maid:Connect(page:GetPropertyChangedSignal("Visible"), function()
+			overlay.Visible = record.Locked and page.Visible
+		end)
+	end
+	if record.Overlay then
+		record.Overlay.Visible = record.Locked and page.Visible
+		record.OverlayText.Text = record.Reason or "This tab is locked for now."
+		record.TabIcon.Visible = record.Locked
+		setInteractable(page, not record.Locked)
+	end
+	if builder.Empty then
+		builder.Empty.Update()
+	end
+	Search.Apply(Search.Query) -- dims the tab's name
+end
+
+local function setTabHidden(builder: any, hidden: boolean)
+	local record = builder.TabRecord
+	if record.Hidden == hidden then
+		return
+	end
+	record.Hidden = hidden
+	local frame = builder.Fluent.Frame
+	if frame then
+		frame.Visible = not hidden
+	end
+	if hidden and builder.Fluent.Selected then
+		local fallback = UI.FirstVisibleTab(builder)
+		if fallback then
+			UI.SelectTab(fallback)
+		end
+	end
+	Search.Apply(Search.Query)
+	task_defer(UI.SyncSelector)
+end
+
+-- Tab & section builders --------------------------------------------------------------------------
+function Builder:SetVisible(visible: boolean): any
+	if self.IsTab then
+		setTabHidden(self, visible == false)
+	else
+		self.SectionRecord.Hidden = visible == false
+		Search.Apply(Search.Query)
+	end
+	return self
+end
+
+function Builder:Hide(): any
+	return self:SetVisible(false)
+end
+
+function Builder:Show(): any
+	return self:SetVisible(true)
+end
+
+function Builder:IsVisible(): boolean
+	local record = if self.IsTab then self.TabRecord else self.SectionRecord
+	return not record.Hidden
+end
+
+function Builder:SetLocked(locked: boolean, reason: string?): any
+	local record = if self.IsTab then self.TabRecord else self.SectionRecord
+	record.Locked = locked ~= false
+	record.Reason = if record.Locked and reason ~= nil then tostring(reason) else nil
+	if self.IsTab then
+		refreshTabLock(self)
+	else
+		refreshSectionLock(record)
+	end
+	return self
+end
+
+function Builder:Lock(reason: string?): any
+	return self:SetLocked(true, reason)
+end
+
+function Builder:Unlock(): any
+	return self:SetLocked(false)
+end
+
+function Builder:IsLocked(): boolean
+	local record = if self.IsTab then self.TabRecord else self.SectionRecord
+	return record.Locked == true
+end
+
+-- Tabs only: switches to this tab.
+function Builder:Select(): any
+	if self.IsTab then
+		UI.SelectTab(self)
+	end
+	return self
 end
 
 -- Changes the card shown while this tab is empty: Tab:SetEmpty("Not Supported", "…", "frown").
@@ -3736,20 +4224,23 @@ function Builder:Section(title: string): any
 	assert(self.IsTab, "Sections can only be created on a tab")
 	local section = self.Fluent:AddSection(title)
 	ScaleFix.Section(section.Container)
+	local record = Search.AddSection(section.Container.Parent)
+	record.Container = section.Container
 	return setmetatable({
 		Fluent = section,
 		Holder = section.Container,
 		TabRecord = self.TabRecord,
-		SectionRecord = Search.AddSection(section.Container.Parent),
+		SectionRecord = record,
 		IsTab = false,
 	}, Builder)
 end
 
-function Builder:_decorate(frame: GuiObject?, spec: any)
-	if frame then
-		Search.Add(frame, tostring(spec.Title or ""), spec.Keywords, self.TabRecord, self.SectionRecord)
-		Tooltip.Attach(frame, spec.Tooltip)
+function Builder:_decorate(frame: GuiObject?, spec: any): any
+	if not frame then
+		return nil
 	end
+	Tooltip.Attach(frame, spec.Tooltip)
+	return Search.Add(frame, tostring(spec.Title or ""), spec.Keywords, self.TabRecord, self.SectionRecord)
 end
 
 function Builder:_value(kind: string, id: string, spec: any): (Entry, any, GuiObject?)
@@ -3774,7 +4265,7 @@ function Builder:_value(kind: string, id: string, spec: any): (Entry, any, GuiOb
 	end)
 	entry.Option = option
 	entry.Frame = frame
-	self:_decorate(frame, spec)
+	UI.Control(option, self:_decorate(frame, spec), entry)
 	return entry, option, frame
 end
 
@@ -4008,7 +4499,7 @@ function Builder:Paragraph(id: any, spec: any?): any
 		entry.Frame = element.Frame
 		finalizeEntry(entry)
 	end
-	self:_decorate(element.Frame, config)
+	UI.Control(proxy, self:_decorate(element.Frame, config), entry)
 	return proxy
 end
 
@@ -4022,7 +4513,7 @@ function Builder:Button(spec: any): any
 			SafeCall(title, callback)
 		end,
 	})
-	self:_decorate(button and button.Frame, spec)
+	UI.Control(button, self:_decorate(button and button.Frame, spec), nil)
 	return button
 end
 
@@ -4578,7 +5069,8 @@ function KeybindList.Refresh()
 			local key = tostring(option.Value)
 			if key ~= "None" and key ~= "" then
 				count += 1
-				local active = keybindActive(entry)
+				local locked = entry.Locked == true
+				local active = not locked and keybindActive(entry)
 				local row = KeybindList.Row(count)
 				row.Name.Text = string_format(
 					'%s  <font transparency="0.45">[%s]%s</font>',
@@ -4587,7 +5079,7 @@ function KeybindList.Refresh()
 					MODE_SUFFIX[option.Mode] or ""
 				)
 				row.Name.TextColor3 = Palette.Text
-				row.State.Text = active and "ON" or "OFF"
+				row.State.Text = if locked then "LOCK" elseif active then "ON" else "OFF"
 				row.State.TextColor3 = active and Palette.Accent or Palette.Text
 				row.State.TextTransparency = active and 0 or 0.55
 				row.Frame.Visible = true
@@ -4648,6 +5140,12 @@ function KeybindList.SetEnabled(enabled: boolean)
 end
 
 function KeybindList.OnPressed(entry: any, toggled: boolean)
+	if entry.Locked then
+		if entry.Option and entry.Option.Mode == "Toggle" then
+			entry.Option.Toggled = not toggled -- Fluent already flipped it; a locked key changes nothing
+		end
+		return
+	end
 	if entry.PressCallback then
 		SafeCall(entry.Title, entry.PressCallback, toggled)
 	end
@@ -4787,7 +5285,9 @@ function Overlays.Create()
 		local holds = KeybindList.HoldMap[key]
 		if holds then
 			for _, entry in ipairs(holds) do
-				SafeCall(entry.Title, (entry :: any).PressCallback, true)
+				if not (entry :: any).Locked then
+					SafeCall(entry.Title, (entry :: any).PressCallback, true)
+				end
 			end
 			KeybindList.Refresh()
 		end
@@ -4797,7 +5297,9 @@ function Overlays.Create()
 		local holds = key and KeybindList.HoldMap[key]
 		if holds then
 			for _, entry in ipairs(holds) do
-				SafeCall(entry.Title, (entry :: any).PressCallback, false)
+				if not (entry :: any).Locked then
+					SafeCall(entry.Title, (entry :: any).PressCallback, false)
+				end
 			end
 			KeybindList.Refresh()
 		end
@@ -5500,6 +6002,8 @@ function App.Unload()
 	table_clear(ScaleFix.Fixers)
 	table_clear(AccentPainters)
 	table_clear(Gradient.Items)
+	table_clear(UI.Tabs)
+	Internals.TabModule = nil
 	Config.Data = nil
 	Notifier.Create = nil
 	Internals.Creator, Internals.Themes, Accent.ThemeSets = nil, nil, nil
@@ -5638,6 +6142,44 @@ local function CreatePublic(): any
 	end
 
 	-- Both dialogs open the window first when it is hidden (dialogs live inside the window).
+	-- Tabs by title (or pass the tab object itself).
+	function public:GetTab(title: string): any
+		return UI.FindTab(title)
+	end
+
+	function public:SelectTab(tab: any): boolean
+		local builder = UI.FindTab(tab)
+		return builder ~= nil and UI.SelectTab(builder)
+	end
+
+	function public:HideTab(tab: any)
+		local builder = UI.FindTab(tab)
+		if builder then
+			builder:Hide()
+		end
+	end
+
+	function public:ShowTab(tab: any)
+		local builder = UI.FindTab(tab)
+		if builder then
+			builder:Show()
+		end
+	end
+
+	function public:LockTab(tab: any, reason: string?)
+		local builder = UI.FindTab(tab)
+		if builder then
+			builder:Lock(reason)
+		end
+	end
+
+	function public:UnlockTab(tab: any)
+		local builder = UI.FindTab(tab)
+		if builder then
+			builder:Unlock()
+		end
+	end
+
 	function public:Confirm(title: string, content: string, onConfirm: () -> (), confirmText: string?)
 		Confirm(title, content, onConfirm, confirmText)
 	end
@@ -5761,7 +6303,10 @@ function App.Finalize()
 		warn(string_format("[%s] building the built-in tabs failed: %s", tostring(SETTINGS.Title), tostring(buildError)))
 	end
 
-	App.Window:SelectTab(1)
+	local first = UI.FirstVisibleTab()
+	if not (first and UI.SelectTab(first)) then
+		App.Window:SelectTab(1)
+	end
 	local profile = Config.CurrentProfile()
 	Win.ApplyGeometry(profile.Window)
 	Overlays.ApplyPositions(profile.Overlays)

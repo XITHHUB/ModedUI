@@ -51,6 +51,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/
 - **Appearance**: theme, live accent colour, UI scale 0.75–1.25, font size (Small/Normal/Large), acrylic blur toggle (off by default).
 - **Notifications**: Info/Success/Warning/Error icons, never more than 3 on screen, mute switch.
 - **Overlays**: watermark (refreshed once per second), draggable keybind list, Info tab (game, server, session, changelog).
+- **Hide & lock**: hide/show and lock/unlock any tab, section or element. Locked things stay visible but dimmed, can't be clicked (a click or hover shows the reason), and locked keybinds don't fire.
 - **Empty tabs**: a tab with no sections or elements shows a "Coming Soon" card with a sad face instead of a blank page. The text and image can be changed per tab, and the card disappears as soon as you add something.
 - **Elements**: tooltips, search keywords, searchable dropdowns (more than 10 options) with `:Refresh(values)`, numeric inputs with Min/Max, every callback wrapped in `pcall` (errors become Error toasts).
 - **Settings tab**: Interface, Animations, Background, Config and Performance (Rejoin, Copy JobId, Reload UI, Unload).
@@ -127,6 +128,10 @@ Dropdowns: `Window.Options[id]:Refresh(newValues)` replaces the options and keep
 
 ```lua
 Window:Tab(title, icon, options)                 -- icon: Lucide name, e.g. "home", "code", "user"
+Window:GetTab(title)                             -- the tab object, or nil
+Window:SelectTab(title)                          -- also accepts a tab object
+Window:HideTab(title) / Window:ShowTab(title)
+Window:LockTab(title, reason) / Window:UnlockTab(title)
 Window:Notify(title, content, duration, type)    -- type: "Info" | "Success" | "Warning" | "Error"
 Window:Confirm(title, content, onConfirm, confirmText) -- dialogs open the window first if it is hidden
 Window:Dialog({ Title, Content, Buttons = { { Title = "OK", Callback = function() end } } })
@@ -165,6 +170,36 @@ Window.Options.UI_Theme:SetValue("Rose")
 Calling `ModedUI:CreateWindow` again creates another independent window (give it a different `Folder`).
 Every window has its own watermark and keybind list, so turn those off on extra windows with
 `ShowWatermark = false` and `ShowKeybindList = false` if one set is enough.
+
+## Hide and lock
+
+Tabs, sections and elements share the same methods. Elements are reached through
+`Window.Options[id]` (or the value an element call returns); buttons and paragraphs return their own object.
+
+```lua
+Tab:Hide()                Tab:Show()                Tab:SetVisible(true)       Tab:IsVisible()
+Tab:Lock("VIP only")      Tab:Unlock()              Tab:SetLocked(true, why)   Tab:IsLocked()
+Tab:Select()              -- tabs only
+```
+
+```lua
+local Chapter2 = Window:Tab("Book 1 Chapter 2", "home")
+Chapter2:Lock("Finish Chapter 1 first!")         -- the tab opens a lock screen with the reason
+Window:HideTab("Book 2 Chapter 3")               -- gone from the tab list until ShowTab
+
+local Farm = Main:Section("Auto farm")
+Farm:Lock("Coming in the next update")           -- dims the whole section
+
+Window.Options.AutoParry:Lock("Unlocks at level 10") -- one element
+Window.Options.AutoParry:Hide()
+```
+
+- Hiding is visual only: hidden elements keep their values and keybinds, and the search bar skips them.
+  Hiding the selected tab switches to the first visible one.
+- Locking blocks mouse input with a dimmed overlay: clicking it shows the reason in a toast, and hovering
+  shows it as a tooltip. A locked keybind doesn't fire, and the keybind list shows it as `LOCK`.
+- Scripts can still change locked values with `:SetValue()`. Locks and hidden states aren't saved in the
+  config, so set them from your script each time it runs.
 
 ## Empty tabs
 

@@ -490,6 +490,59 @@ Looks:Button({
 	end,
 })
 
+-- Tabs, sections and elements can be hidden and locked. Locked things stay visible but dimmed,
+-- can't be clicked (a click says why), and a locked keybind doesn't fire.
+local Access = Api:Section("Hide & lock")
+
+Access:Button({
+	Title = "Hide / show the Soon tab",
+	Description = "Window:GetTab(\"Soon\"):Hide() / :Show()",
+	Tooltip = "Also: Window:HideTab(title), Window:ShowTab(title).",
+	Callback = function()
+		local soon = Window:GetTab("Soon")
+		soon:SetVisible(not soon:IsVisible())
+	end,
+})
+
+Access:Button({
+	Title = "Lock / unlock the Chapter 3 tab",
+	Description = "Window:LockTab(\"Chapter 3\", reason) / Window:UnlockTab(\"Chapter 3\")",
+	Tooltip = "A locked tab still opens, but shows a lock screen with the reason.",
+	Callback = function()
+		local chapter = Window:GetTab("Chapter 3")
+		chapter:SetLocked(not chapter:IsLocked(), "Finish Chapter 2 first!")
+	end,
+})
+
+Access:Button({
+	Title = "Lock / unlock the Camera section",
+	Description = "Camera:Lock(reason) / Camera:Unlock() on the Main tab.",
+	Tooltip = "Sections have the same methods as tabs.",
+	Callback = function()
+		Camera:SetLocked(not Camera:IsLocked(), "Camera tools are VIP only.")
+	end,
+})
+
+Access:Button({
+	Title = "Lock / unlock \"Highlight my character\"",
+	Description = "Options.HighlightSelf:Lock(reason) / :Unlock()",
+	Tooltip = "Elements have them too; scripts can still change a locked value.",
+	Callback = function()
+		local toggle = Options.HighlightSelf
+		toggle:SetLocked(not toggle:IsLocked(), "Unlocks at level 10.")
+	end,
+})
+
+Access:Button({
+	Title = "Hide / show the Note input",
+	Description = "Options.NotesInput:Hide() / :Show()",
+	Tooltip = "Hidden elements are skipped by the search bar too.",
+	Callback = function()
+		local input = Options.NotesInput
+		input:SetVisible(not input:IsVisible())
+	end,
+})
+
 local ConfigApi = Api:Section("Config")
 
 local configInfo = ConfigApi:Paragraph({ -- no id: not saved
