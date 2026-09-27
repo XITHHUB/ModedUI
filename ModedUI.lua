@@ -1,5 +1,5 @@
 --[[
-	ModedUI  ·  v1.1.0
+	ModedUI  ·  v1.2.0
 	A batteries-included UI library built on Fluent by dawid-scripts
 	https://github.com/XITHHUB/ModedUI  ·  Fluent: https://github.com/dawid-scripts/Fluent
 
@@ -17,6 +17,7 @@
 	    gradient border, rainbow accent (all native tweens or a throttled 20 Hz step)
 	  • Rate-limited notifications (max 3 on screen) with type icons and a mute switch
 	  • Watermark (1 Hz), draggable keybind list overlay, Info and Settings tabs
+	  • Empty tabs show a "Coming Soon" card with a sad face (text and image per tab)
 	  • Element wrapper: every element is saved by its id automatically
 	  • Maid-based cleanup, double-load protection, every callback pcall'd
 
@@ -25,7 +26,7 @@
 	  6. Window     7. Tabs        8. Overlays         9. Settings       10. Init (public API)
 ]]
 
-local LIBRARY_VERSION = "1.1.0"
+local LIBRARY_VERSION = "1.2.0"
 local LIBRARY_CHUNK = debug.info(1, "f") -- lets each additional window run on a fresh library copy
 local CONFIG_VERSION = 2 -- saved file format (see MIGRATIONS in section 4)
 
@@ -56,6 +57,9 @@ local DEFAULTS = {
 	MovingGradient = true, -- animated gradient on the window border and the profile ring
 	RainbowAccent = false, -- accent colour cycles through the rainbow
 	RainbowSpeed = 3, -- 1 (20 s per cycle) … 10 (2 s per cycle)
+	-- Card shown on tabs with no sections or elements: { Title, Text, Image } (Image = Lucide
+	-- name, asset id or content URL). Defaults: "Coming Soon", sad face. false = no card.
+	EmptyTab = nil :: any,
 	WelcomeToast = true, -- "Loaded in 0.07s" toast once everything is built
 	Changelog = { "v1.0.0", "• First release" },
 	Reload = nil :: (() -> ())?, -- re-runs your script; defaults to the function that called CreateWindow
@@ -3569,21 +3573,163 @@ end
 
 UI.TabCount = 0
 
+-- Empty tabs ------------------------------------------------------------------------------
+-- A tab with nothing in it (no section, no element) shows a "Coming Soon" card with a sad
+-- face instead of a blank page. The card sits next to the tab's page, follows the page's
+-- visibility and hides as soon as anything is added. Event-driven only (ChildAdded /
+-- ChildRemoved / Visible); the face's gentle float is a native tween that only plays while
+-- the card is on screen.
+local EMPTY_DEFAULTS = { Title = "Coming Soon", Text = "Nothing here yet. Check back later!", Image = "frown" }
+local EMPTY_FLOAT = TweenInfo.new(1.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+
+-- Lucide name ("frown"), asset id digits, or any content URL (rbxassetid://, rbxthumb://).
+local function emptyImage(image: any): string
+	local fluent = App.Fluent
+	if type(image) == "number" or (type(image) == "string" and string_match(image, "^%d+$")) then
+		return "rbxassetid://" .. tostring(image)
+	end
+	if type(image) == "string" and image ~= "" then
+		if string_find(image, "://", 1, true) then
+			return image
+		end
+		local icon = fluent:GetIcon(image)
+		if icon then
+			return icon
+		end
+	end
+	return fluent:GetIcon(EMPTY_DEFAULTS.Image) or ""
+end
+
+local function attachEmptyState(builder: any, options: any)
+	local page = builder.Fluent.ContainerFrame
+	local holder = page and page.Parent
+	if not holder then
+		return
+	end
+	local icon = Util.Create("ImageLabel", {
+		Name = "Face",
+		BackgroundTransparency = 1,
+		ImageTransparency = 0.3,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2_fromScale(0.5, 0.5),
+		Size = UDim2_fromOffset(48, 48),
+	})
+	local title = Util.Create("TextLabel", {
+		Name = "Title",
+		BackgroundTransparency = 1,
+		FontFace = FONT_BOLD,
+		TextSize = 20,
+		TextWrapped = true,
+		Size = UDim2_new(1, -40, 0, 26),
+		LayoutOrder = 2,
+	})
+	local text = Util.Create("TextLabel", {
+		Name = "Text",
+		BackgroundTransparency = 1,
+		FontFace = FONT_REGULAR,
+		TextSize = 13,
+		TextTransparency = 0.35,
+		TextWrapped = true,
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Size = UDim2_new(1, -60, 0, 0),
+		LayoutOrder = 3,
+	})
+	local frame = Util.Create("Frame", {
+		Name = "EmptyState",
+		BackgroundTransparency = 1,
+		Size = UDim2_fromScale(1, 1),
+		Visible = false,
+		Parent = holder,
+	}, {
+		Util.Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim_new(0, 4),
+		}),
+		Util.Create("Frame", {
+			Name = "FaceHolder",
+			BackgroundTransparency = 1,
+			Size = UDim2_fromOffset(64, 60),
+			LayoutOrder = 1,
+		}, { icon }),
+		title,
+		text,
+	})
+	Win.Paint(function(palette)
+		icon.ImageColor3 = palette.Text
+		title.TextColor3 = palette.Text
+		text.TextColor3 = palette.Text
+	end)
+	local float = TweenService:Create(icon, EMPTY_FLOAT, { Position = UDim2_new(0.5, 0, 0.5, -5) })
+	App.Maid:Give(float)
+
+	local function update()
+		local empty = true
+		for _, child in ipairs(page:GetChildren()) do
+			if child:IsA("GuiObject") then
+				empty = false
+				break
+			end
+		end
+		local visible = empty and page.Visible
+		if frame.Visible ~= visible then
+			frame.Visible = visible
+		end
+		if visible then
+			if float.PlaybackState ~= Enum.PlaybackState.Playing then
+				float:Play()
+			end
+		elseif float.PlaybackState == Enum.PlaybackState.Playing then
+			float:Pause()
+		end
+	end
+	App.Maid:Connect(page.ChildAdded, update)
+	App.Maid:Connect(page.ChildRemoved, update)
+	App.Maid:Connect(page:GetPropertyChangedSignal("Visible"), update)
+
+	builder.Empty = { Frame = frame, Title = title, Text = text, Icon = icon }
+	local defaults = if type(SETTINGS.EmptyTab) == "table" then SETTINGS.EmptyTab else {}
+	builder:SetEmpty(
+		options.EmptyTitle or defaults.Title,
+		options.EmptyText or defaults.Text,
+		options.EmptyImage or defaults.Image
+	)
+	update()
+end
+
 -- layoutOrder is only passed by the built-in Info/Settings tabs, which always sort last.
-function UI.Tab(title: string, icon: string?, layoutOrder: number?): any
+-- options: { EmptyTitle, EmptyText, EmptyImage } for the card shown while the tab is empty.
+function UI.Tab(title: string, icon: string?, layoutOrder: number?, options: any?): any
 	local tab = App.Window:AddTab({ Title = title, Icon = icon or "" })
 	UI.TabCount += 1
 	if tab.Frame then
 		tab.Frame.LayoutOrder = layoutOrder or UI.TabCount
 	end
 	ScaleFix.Canvas(tab.ContainerFrame, 2)
-	return setmetatable({
+	local builder = setmetatable({
 		Fluent = tab,
 		Holder = tab.Container,
 		TabRecord = Search.AddTab(tab, title),
 		SectionRecord = nil,
 		IsTab = true,
 	}, Builder)
+	if SETTINGS.EmptyTab ~= false and layoutOrder == nil then -- (the built-in tabs are never empty)
+		attachEmptyState(builder, if type(options) == "table" then options else {})
+	end
+	return builder
+end
+
+-- Changes the card shown while this tab is empty: Tab:SetEmpty("Not Supported", "…", "frown").
+function Builder:SetEmpty(title: string?, text: string?, image: any?): any
+	local empty = self.Empty
+	if empty then
+		empty.Title.Text = tostring(title or EMPTY_DEFAULTS.Title)
+		empty.Text.Text = tostring(text or EMPTY_DEFAULTS.Text)
+		empty.Icon.Image = emptyImage(image)
+	end
+	return self
 end
 
 function Builder:Section(title: string): any
@@ -5481,8 +5627,10 @@ local function CreatePublic(): any
 		end,
 	}
 
-	function public:Tab(title: string, icon: string?): any
-		return UI.Tab(title, icon)
+	-- options (optional): { EmptyTitle, EmptyText, EmptyImage } for the card shown while the
+	-- tab has no sections or elements.
+	function public:Tab(title: string, icon: string?, options: { [string]: any }?): any
+		return UI.Tab(title, icon, nil, options)
 	end
 
 	function public:Notify(title: string?, content: string?, duration: number?, kind: NotifyKind?, subContent: string?): any

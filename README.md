@@ -51,6 +51,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/
 - **Appearance**: theme, live accent colour, UI scale 0.75–1.25, font size (Small/Normal/Large), acrylic blur toggle (off by default).
 - **Notifications**: Info/Success/Warning/Error icons, never more than 3 on screen, mute switch.
 - **Overlays**: watermark (refreshed once per second), draggable keybind list, Info tab (game, server, session, changelog).
+- **Empty tabs**: a tab with no sections or elements shows a "Coming Soon" card with a sad face instead of a blank page. The text and image can be changed per tab, and the card disappears as soon as you add something.
 - **Elements**: tooltips, search keywords, searchable dropdowns (more than 10 options) with `:Refresh(values)`, numeric inputs with Min/Max, every callback wrapped in `pcall` (errors become Error toasts).
 - **Settings tab**: Interface, Animations, Background, Config and Performance (Rejoin, Copy JobId, Reload UI, Unload).
 - **Performance**: the whole build is themed in one pass, services and globals are cached, one timer for autosave, everything is cleaned up by a Maid, and executing the script twice replaces the old window. The moving gradient and window animations are native tweens; the rainbow accent recolours only accent parts 20 times per second; both pause while the window is hidden, and the theme fade only runs while colours change.
@@ -84,6 +85,7 @@ Every option is optional.
 | `MovingGradient` | `true` | Animated gradient on the window border and profile ring |
 | `RainbowAccent` | `false` | Accent colour cycles through the rainbow |
 | `RainbowSpeed` | `3` | 1 (20 s per cycle) to 10 (2 s per cycle) |
+| `EmptyTab` | `{ Title = "Coming Soon", Text = "Nothing here yet. Check back later!", Image = "frown" }` | Card for tabs with no sections or elements (`false` turns it off) |
 | `WelcomeToast` | `true` | "Loaded in 0.07s" toast |
 | `Changelog` | `{ "v1.0.0", "• First release" }` | Lines shown in the Info tab |
 | `Reload` | your script | Function that Reload UI runs; defaults to the script that called `CreateWindow` |
@@ -124,7 +126,7 @@ Dropdowns: `Window.Options[id]:Refresh(newValues)` replaces the options and keep
 ## Window API
 
 ```lua
-Window:Tab(title, icon)                          -- icon: Lucide name, e.g. "home", "code", "user"
+Window:Tab(title, icon, options)                 -- icon: Lucide name, e.g. "home", "code", "user"
 Window:Notify(title, content, duration, type)    -- type: "Info" | "Success" | "Warning" | "Error"
 Window:Confirm(title, content, onConfirm, confirmText) -- dialogs open the window first if it is hidden
 Window:Dialog({ Title, Content, Buttons = { { Title = "OK", Callback = function() end } } })
@@ -163,6 +165,25 @@ Window.Options.UI_Theme:SetValue("Rose")
 Calling `ModedUI:CreateWindow` again creates another independent window (give it a different `Folder`).
 Every window has its own watermark and keybind list, so turn those off on extra windows with
 `ShowWatermark = false` and `ShowKeybindList = false` if one set is enough.
+
+## Empty tabs
+
+A tab without sections or elements shows a card with a sad face until you add something to it:
+
+```lua
+Window:Tab("Book 1 Chapter 2", "home") -- shows "Coming Soon"
+
+local Chapter3 = Window:Tab("Book 1 Chapter 3", "home", {
+	EmptyTitle = "Not Supported",
+	EmptyText = "This chapter isn't supported yet.",
+	EmptyImage = "frown", -- Lucide icon name, asset id or rbxassetid:// URL
+})
+
+Chapter3:SetEmpty("Coming Soon", "Being worked on right now!") -- change it later
+```
+
+Set `EmptyTab = { Title = …, Text = …, Image = … }` in `CreateWindow` to change the default for every
+tab, or `EmptyTab = false` to turn the card off.
 
 ## Config file
 

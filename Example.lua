@@ -530,5 +530,17 @@ ConfigApi:Button({
 	Callback = showConfigInfo,
 })
 
+--════════════════════════════════════════════════════════════════════════════
+-- Empty tabs: a tab with no sections or elements shows a card with a sad face until you add
+-- something to it. The text and image can be set per tab.
+--════════════════════════════════════════════════════════════════════════════
+Window:Tab("Soon", "hourglass") -- default card: "Coming Soon"
+
+Window:Tab("Chapter 3", "book", {
+	EmptyTitle = "Not Supported",
+	EmptyText = "This chapter isn't supported yet.",
+	-- EmptyImage = "frown", -- a Lucide icon name, an asset id or an rbxassetid:// URL
+})
+
 -- That's it: the Info and Settings tabs, the saved window position and the welcome toast are
 -- added automatically right after this script finishes.
