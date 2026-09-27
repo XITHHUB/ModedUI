@@ -1,5 +1,5 @@
 --[[
-	ModedUI  ·  v1.0.0
+	ModedUI  ·  v1.1.0
 	A batteries-included UI library built on Fluent by dawid-scripts
 	https://github.com/XITHHUB/ModedUI  ·  Fluent: https://github.com/dawid-scripts/Fluent
 
@@ -11,8 +11,10 @@
 	Features
 	  • Background image from a URL (downloaded once, cached to disk, loaded with getcustomasset)
 	  • Per-player JSON config: profiles, autosave (on/off + delay), import/export, corrupt-file backup
-	  • Search across all tabs, smooth open/close, mobile toggle button + auto-fit, UI scale
+	  • Player profile card, search across all tabs, mobile toggle button + auto-fit, UI scale
 	  • Theme / accent / font size / acrylic controls, all saved per profile
+	  • Animations: open/close styles (Zoom, Fade, Slide, Pop), smooth theme fade, moving
+	    gradient border, rainbow accent (all native tweens or a throttled 20 Hz step)
 	  • Rate-limited notifications (max 3 on screen) with type icons and a mute switch
 	  • Watermark (1 Hz), draggable keybind list overlay, Info and Settings tabs
 	  • Element wrapper: every element is saved by its id automatically
@@ -23,7 +25,7 @@
 	  6. Window     7. Tabs        8. Overlays         9. Settings       10. Init (public API)
 ]]
 
-local LIBRARY_VERSION = "1.0.0"
+local LIBRARY_VERSION = "1.1.0"
 local LIBRARY_CHUNK = debug.info(1, "f") -- lets each additional window run on a fresh library copy
 local CONFIG_VERSION = 2 -- saved file format (see MIGRATIONS in section 4)
 
@@ -48,6 +50,12 @@ local DEFAULTS = {
 	SettingsTab = true,
 	ShowWatermark = true,
 	ShowKeybindList = true,
+	PlayerCard = true, -- avatar + name above the search bar
+	AnimationStyle = "Zoom", -- open/close animation: "Zoom", "Fade", "Slide", "Pop" or "None"
+	ThemeFade = true, -- theme and accent changes fade instead of snapping
+	MovingGradient = true, -- animated gradient on the window border and the profile ring
+	RainbowAccent = false, -- accent colour cycles through the rainbow
+	RainbowSpeed = 3, -- 1 (20 s per cycle) … 10 (2 s per cycle)
 	WelcomeToast = true, -- "Loaded in 0.07s" toast once everything is built
 	Changelog = { "v1.0.0", "• First release" },
 	Reload = nil :: (() -> ())?, -- re-runs your script; defaults to the function that called CreateWindow
@@ -63,6 +71,7 @@ if not game:IsLoaded() then
 end
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
@@ -151,7 +160,6 @@ local App = {
 	Maid = nil :: any,
 	BlurFolder = nil :: Instance?,
 	OriginalDestroy = nil :: any,
-	AnimationsEnabled = true,
 	Self = nil :: any, -- function App.Reload() runs again (your script)
 }
 
@@ -175,12 +183,14 @@ local MobileButton: any = {}
 local Clock: any = {}
 local Perf: any = {}
 local ScaleFix: any = {}
+local Card: any = {}
+local Rainbow: any = {}
+local Gradient: any = {}
+local Fade: any = {}
 
 --══════════════════════════════════════════════════════════════════════════════
 -- 2. UTILITIES
 --══════════════════════════════════════════════════════════════════════════════
-local TWEEN_OPEN = TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
-local TWEEN_CLOSE = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 local FONT_REGULAR = Font.new("rbxasset://fonts/families/GothamSSm.json")
 local FONT_MEDIUM = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium)
 local FONT_BOLD = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.SemiBold)
@@ -2107,6 +2117,14 @@ local Palette = {
 	Light = false,
 }
 local Painters: { (typeof(Palette)) -> () } = {}
+-- Accent-only painters: cheap enough for every rainbow step (a colour or two each).
+local AccentPainters: { (Color3) -> () } = {}
+
+local function runAccentPainters(color: Color3)
+	for _, painter in ipairs(AccentPainters) do
+		SafeCall("Theme", painter, color)
+	end
+end
 
 -- Accent --------------------------------------------------------------------------
 local THEME_ACCENTS = {
@@ -2196,7 +2214,7 @@ function Accent.SetFallback(color: Color3?)
 end
 
 function Accent.ScheduleRecolor()
-	if Accent.RecolorQueued or not Accent.FallbackActive then
+	if Accent.RecolorQueued or not Accent.FallbackActive or Win.Reparenting then
 		return
 	end
 	Accent.RecolorQueued = true
@@ -2236,6 +2254,9 @@ function Accent.Apply()
 		Accent.SetFallback(color)
 	end
 	Win.ThemeSync()
+	if Rainbow.Active then
+		Accent.Paint(Rainbow.Color()) -- no flash of the stock accent between two rainbow steps
+	end
 end
 
 function Accent.Set(enabled: boolean?, color: Color3?)
@@ -2245,9 +2266,51 @@ function Accent.Set(enabled: boolean?, color: Color3?)
 	if color then
 		Accent.Color = color
 	end
-	if App.Ready or Accent.Enabled then
+	if App.Ready then
+		Fade.Run(Accent.Apply)
+	elseif Accent.Enabled then
 		Accent.Apply()
 	end
+end
+
+-- Recolours only what is tagged "Accent" (a few dozen instances) and patches the theme tables,
+-- so whatever Fluent repaints later (a toggle switching on, new elements) gets the same colour.
+-- Used by the rainbow accent on every step; without debug access it falls back to slower paths.
+function Accent.Paint(color: Color3)
+	local fluent = App.Fluent
+	if not fluent then
+		return
+	end
+	local sets = Accent.ResolveThemes()
+	if sets then
+		for _, themes in ipairs(sets) do
+			for _, name in ipairs(themes.Names) do
+				local theme = rawget(themes, name)
+				if type(theme) == "table" then
+					if Accent.Originals[theme] == nil then
+						Accent.Originals[theme] = theme.Accent
+					end
+					theme.Accent = color
+				end
+			end
+		end
+	end
+	local creator = Internals.Creator
+	if creator then
+		for instance, data in pairs(creator.Registry) do
+			for property, key in pairs(data.Properties) do
+				if key == "Accent" then
+					instance[property] = color
+				end
+			end
+		end
+	elseif sets then
+		fluent:SetTheme(fluent.Theme)
+	else
+		Accent.SetFallback(color)
+	end
+	Palette.Accent = color
+	runAccentPainters(color)
 end
 
 -- Font size ------------------------------------------------------------------------
@@ -2289,7 +2352,7 @@ local function flushFontQueue()
 end
 
 local function queueFontObject(instance: Instance)
-	if not isTextObject(instance) then
+	if Win.Reparenting or not isTextObject(instance) then
 		return
 	end
 	local pending = FontSize.Pending
@@ -2502,6 +2565,240 @@ function ScaleFix.RefreshAll()
 	end
 end
 
+-- Motion: rainbow accent, moving gradient, theme fade ----------------------------------------
+-- Rainbow: a throttled step (20 Hz, Heartbeat connected only while it is on AND the window is
+-- open) that recolours just the accent-tagged instances. Gradient: native looping tweens of
+-- UIGradient.Rotation, paused while the window is hidden. Fade: runs once per theme/accent
+-- change; nothing is left running afterwards.
+local WHITE = Color3.new(1, 1, 1)
+
+Rainbow.Enabled = false
+Rainbow.Active = false
+Rainbow.Speed = 3
+Rainbow.Hue = 0
+Rainbow.Elapsed = 0
+
+function Rainbow.Color(): Color3
+	if Palette.Light then
+		return Color3.fromHSV(Rainbow.Hue, 0.8, 0.82)
+	end
+	return Color3.fromHSV(Rainbow.Hue, 0.62, 1)
+end
+
+local function rainbowStep(deltaTime: number)
+	Rainbow.Elapsed += deltaTime
+	-- Without Fluent's registry every step is a full repaint, so it runs 4x less often.
+	local interval = if Internals.Creator then 0.05 else 0.25
+	if Rainbow.Elapsed < interval then
+		return
+	end
+	Rainbow.Hue = (Rainbow.Hue + Rainbow.Elapsed * Rainbow.Speed / 20) % 1
+	Rainbow.Elapsed = 0
+	local ok, err = pcall(Accent.Paint, Rainbow.Color())
+	if not ok then
+		warn(string_format("[%s] rainbow accent stopped: %s", SETTINGS.Title, tostring(err)))
+		Rainbow.Enabled = false
+		Rainbow.Refresh()
+	end
+end
+
+function Rainbow.Refresh()
+	local run = Rainbow.Enabled and Win.Open and App.Window ~= nil and not App.Unloaded
+	if run == Rainbow.Active then
+		return
+	end
+	Rainbow.Active = run
+	Rainbow.Elapsed = 0
+	if App.Maid then
+		App.Maid:Set("Rainbow", if run then RunService.Heartbeat:Connect(rainbowStep) else nil)
+	end
+end
+
+function Rainbow.SetEnabled(enabled: boolean)
+	enabled = enabled == true
+	if enabled == Rainbow.Enabled then
+		return
+	end
+	Rainbow.Enabled = enabled
+	if enabled then
+		Rainbow.Hue = (Palette.Accent:ToHSV()) -- start the cycle at the current accent
+	end
+	Rainbow.Refresh()
+	if not enabled and App.Window then
+		Fade.Run(Accent.Apply) -- back to the theme or custom accent
+	end
+end
+
+function Rainbow.SetSpeed(speed: number)
+	Rainbow.Speed = math_clamp(tonumber(speed) or 3, 1, 10)
+end
+
+Gradient.Enabled = true
+Gradient.Items = {} :: { any }
+Gradient.Border = nil :: Frame?
+
+-- Accent → hue-shifted accent → highlight → accent (brightened, so dark accents still glow).
+local function gradientColors(color: Color3): ColorSequence
+	local hue, saturation, value = color:ToHSV()
+	saturation, value = math_max(saturation, 0.45), math_max(value, 0.9)
+	local base = Color3.fromHSV(hue, saturation, value)
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, base),
+		ColorSequenceKeypoint.new(0.3, Color3.fromHSV((hue + 0.15) % 1, saturation, value)),
+		ColorSequenceKeypoint.new(0.6, base:Lerp(WHITE, 0.55)),
+		ColorSequenceKeypoint.new(1, base),
+	})
+end
+
+-- stroke: UIStroke to animate · period: seconds per turn · keep: show the plain accent stroke
+-- when the effect is off (false = hide the stroke instead).
+function Gradient.Add(stroke: UIStroke, period: number, keep: boolean)
+	local item = {
+		Stroke = stroke,
+		Gradient = Util.Create("UIGradient", { Enabled = false, Parent = stroke }),
+		Period = period,
+		Keep = keep,
+		Tween = nil :: Tween?,
+	}
+	Gradient.Items[#Gradient.Items + 1] = item
+	return item
+end
+
+local function paintGradients(color: Color3)
+	local sequence = if Gradient.Enabled then gradientColors(color) else nil
+	for _, item in ipairs(Gradient.Items) do
+		if sequence then
+			item.Gradient.Color = sequence
+		else
+			item.Stroke.Color = color
+		end
+	end
+end
+
+function Gradient.Refresh()
+	local enabled = Gradient.Enabled
+	local run = enabled and Win.Open and not App.Unloaded
+	for _, item in ipairs(Gradient.Items) do
+		local stroke, gradient = item.Stroke, item.Gradient
+		gradient.Enabled = enabled
+		stroke.Enabled = enabled or item.Keep
+		if enabled then
+			stroke.Color = WHITE -- the gradient multiplies the stroke colour
+		end
+		local tween = item.Tween
+		if run then
+			if not tween then
+				gradient.Rotation = 0
+				tween = TweenService:Create(
+					gradient,
+					TweenInfo.new(item.Period, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1),
+					{ Rotation = 360 }
+				)
+				item.Tween = tween
+				App.Maid:Give(tween)
+			end
+			if tween.PlaybackState ~= Enum.PlaybackState.Playing then
+				tween:Play()
+			end
+		elseif tween and tween.PlaybackState == Enum.PlaybackState.Playing then
+			tween:Pause()
+		end
+	end
+	paintGradients(Palette.Accent)
+end
+
+function Gradient.SetEnabled(enabled: boolean)
+	Gradient.Enabled = enabled == true
+	Gradient.Refresh()
+end
+
+-- Theme fade: snapshot every themed property, apply the change, then tween each property that
+-- changed from its old value to its new one (one tween per instance, Quad Out, 0.35 s).
+Fade.Enabled = true
+Fade.Tweens = {} :: { Tween }
+local FADE_INFO = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local FADE_PROPERTIES: { [string]: { string } } = {
+	Frame = { "BackgroundColor3", "BackgroundTransparency" },
+	CanvasGroup = { "BackgroundColor3", "BackgroundTransparency" },
+	TextLabel = { "BackgroundColor3", "BackgroundTransparency", "TextColor3" },
+	TextButton = { "BackgroundColor3", "BackgroundTransparency", "TextColor3" },
+	TextBox = { "BackgroundColor3", "BackgroundTransparency", "TextColor3", "PlaceholderColor3" },
+	ImageLabel = { "BackgroundColor3", "BackgroundTransparency", "ImageColor3", "ImageTransparency" },
+	ImageButton = { "BackgroundColor3", "BackgroundTransparency", "ImageColor3", "ImageTransparency" },
+	ScrollingFrame = { "BackgroundColor3", "BackgroundTransparency", "ScrollBarImageColor3" },
+	UIStroke = { "Color", "Transparency" },
+}
+
+function Fade.Stop()
+	local tweens = Fade.Tweens
+	for index = #tweens, 1, -1 do
+		local tween = tweens[index]
+		tweens[index] = nil
+		tween:Cancel() -- values stay where they are; the next change fades on from there
+		tween:Destroy()
+	end
+	if App.Maid then
+		App.Maid:Set("FadeCleanup", nil)
+	end
+end
+
+function Fade.Run(apply: () -> ())
+	if not Fade.Enabled or not App.Ready or App.Unloaded then
+		apply()
+		return
+	end
+	Fade.Stop()
+	local before: { [Instance]: { any } } = {}
+	local order: { Instance } = {}
+	for _, root in ipairs(FontSize.Roots()) do
+		for _, instance in ipairs(root:GetDescendants()) do
+			local properties = FADE_PROPERTIES[instance.ClassName]
+			if properties then
+				local values = table.create(#properties)
+				for index, property in ipairs(properties) do
+					values[index] = (instance :: any)[property]
+				end
+				before[instance] = values
+				order[#order + 1] = instance
+			end
+		end
+	end
+	apply()
+	-- While the rainbow runs it owns the accent-tagged properties; don't fight it.
+	local registry = if Rainbow.Active and Internals.Creator then Internals.Creator.Registry else nil
+	local tweens = Fade.Tweens
+	for _, instance in ipairs(order) do
+		if instance.Parent then
+			local target = instance :: any
+			local properties = FADE_PROPERTIES[instance.ClassName]
+			local old = before[instance]
+			local tags = registry and registry[instance] and registry[instance].Properties
+			local goal = nil
+			for index, property in ipairs(properties) do
+				local value = target[property]
+				if value ~= old[index] and not (tags and tags[property] == "Accent") then
+					goal = goal or {}
+					goal[property] = value
+					target[property] = old[index]
+				end
+			end
+			if goal then
+				local tween = TweenService:Create(instance, FADE_INFO, goal)
+				tweens[#tweens + 1] = tween
+				tween:Play()
+			end
+		end
+	end
+	if #tweens > 0 then
+		App.Maid:Set("FadeCleanup", task_delay(FADE_INFO.Time + 0.1, function()
+			for index = #tweens, 1, -1 do
+				tweens[index]:Destroy()
+				tweens[index] = nil
+			end
+		end))
+	end
+end
+
 -- Window ---------------------------------------------------------------------------
 Win.Scale = nil :: UIScale?
 Win.UserScale = 1
@@ -2514,6 +2811,8 @@ Win.RestPosition = nil :: UDim2?
 Win.LastGeometry = nil :: any
 Win.SearchBox = nil :: TextBox?
 Win.SearchCount = nil :: TextLabel?
+Win.SearchFrame = nil :: Frame?
+Win.TabFrame = nil :: Frame?
 Win.OriginalMaximize = nil :: any
 
 function Win.Paint(painter: (typeof(Palette)) -> ())
@@ -2535,6 +2834,12 @@ function Win.ThemeSync()
 	for _, painter in ipairs(Painters) do
 		SafeCall("Theme", painter, Palette)
 	end
+	runAccentPainters(Palette.Accent)
+end
+
+function Win.PaintAccent(painter: (Color3) -> ())
+	AccentPainters[#AccentPainters + 1] = painter
+	SafeCall("Theme", painter, Palette.Accent)
 end
 
 -- Uniform window scale = min(user scale, what fits on screen). Drives one UIScale.
@@ -2629,11 +2934,133 @@ function Win.KeepOnScreen()
 	end
 end
 
--- Open/close animation: one UIScale tween + one Position tween (native, no per-frame Lua), with
--- the position compensated so the window zooms from its centre.
+-- Open/close animation ----------------------------------------------------------------------
+-- Scale and position are native tweens on the window's UIScale and root. For the fade, the root
+-- is moved into a full-screen CanvasGroup only for the length of the animation (one
+-- GroupTransparency tween), then put back, so the window never renders through a texture while
+-- it is idle. Scale and position share one easing, so zooms stay centred even with Back easing.
+local ANIMATIONS = {
+	Zoom = {
+		OpenScale = 0.92,
+		CloseScale = 0.92,
+		OpenShift = 0,
+		CloseShift = 0,
+		Open = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+		Close = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+	},
+	Fade = {
+		OpenScale = 1,
+		CloseScale = 1,
+		OpenShift = 0,
+		CloseShift = 0,
+		Open = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		Close = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+	},
+	Slide = {
+		OpenScale = 1,
+		CloseScale = 1,
+		OpenShift = 26,
+		CloseShift = 18,
+		Open = TweenInfo.new(0.26, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+		Close = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+	},
+	Pop = {
+		OpenScale = 0.8,
+		CloseScale = 0.86,
+		OpenShift = 0,
+		CloseShift = 0,
+		Open = TweenInfo.new(0.34, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		Close = TweenInfo.new(0.16, Enum.EasingStyle.Back, Enum.EasingDirection.In),
+	},
+}
+local ANIMATION_STYLES = { "Zoom", "Fade", "Slide", "Pop", "None" }
+local FADE_IN = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local FADE_OUT = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+local ZERO_OFFSET = UDim2_fromOffset(0, 0)
+Win.Style = "Zoom"
+Win.Host = nil :: CanvasGroup?
+Win.Hosted = false
+Win.Reparenting = false
+
+function Win.ValidStyle(style: any): string?
+	if style == "None" or (type(style) == "string" and ANIMATIONS[style] ~= nil) then
+		return style
+	end
+	return nil
+end
+
+function Win.SetStyle(style: string?)
+	Win.FinishAnimation()
+	Win.Style = Win.ValidStyle(style) or "Zoom"
+end
+
+-- Saved style → the old Animations toggle (off = "None") → the AnimationStyle option → Zoom.
+function Win.DefaultStyle(): string
+	local saved = Config.Peek("UI_AnimationStyle", Win.ValidStyle)
+	if saved then
+		return saved
+	end
+	if Config.Peek("UI_Animations", function(value)
+		return value == false
+	end) then
+		return "None"
+	end
+	return Win.ValidStyle(SETTINGS.AnimationStyle) or "Zoom"
+end
+
+local function moveRoot(parent: Instance)
+	Win.Reparenting = true -- (font/accent watchers skip the move when signals fire immediately)
+	pcall(function()
+		App.Window.Root.Parent = parent
+	end)
+	Win.Reparenting = false
+end
+
+-- Moves the window into the fade host (created on first use). nil when CanvasGroup is unavailable.
+local function hostWindow(): CanvasGroup?
+	local window, fluent = App.Window, App.Fluent
+	local host = Win.Host
+	if not host then
+		local ok, created = pcall(Util.Create, "CanvasGroup", {
+			Name = "WindowAnimation",
+			BackgroundTransparency = 1,
+			Size = UDim2_fromScale(1, 1),
+			ZIndex = window.Root.ZIndex,
+			Visible = false,
+			Parent = fluent.GUI,
+		})
+		if not ok then
+			return nil
+		end
+		host = created
+		Win.Host = created
+	end
+	local canvas = host :: CanvasGroup
+	canvas.GroupTransparency = 0
+	canvas.Visible = true
+	moveRoot(canvas)
+	Win.Hosted = true
+	return canvas
+end
+
+local function unhostWindow()
+	if not Win.Hosted then
+		return
+	end
+	Win.Hosted = false
+	if App.Window and App.Fluent then
+		moveRoot(App.Fluent.GUI)
+	end
+	local host = Win.Host
+	if host then
+		host.Visible = false
+		host.GroupTransparency = 0
+	end
+end
+
 function Win.FinishAnimation()
 	local tweens = Win.Tweens
-	if #tweens == 0 then
+	if #tweens == 0 and not Win.Hosted then
 		return
 	end
 	for index = #tweens, 1, -1 do
@@ -2650,6 +3077,7 @@ function Win.FinishAnimation()
 	if Win.Scale then
 		Win.Scale.Scale = Win.BaseScale
 	end
+	unhostWindow()
 	if not Win.Open and not window.Minimized then
 		Win.OriginalMinimize(window)
 	end
@@ -2670,11 +3098,12 @@ function Win.Toggle(forceOpen: boolean?)
 		Win.OriginalMinimize(window) -- Fluent shows the root (and its one-time key hint)
 	end
 	Tooltip.Hide()
-	if not App.AnimationsEnabled or not Win.Scale then
+	Overlays.OnWindowToggled(opening)
+	local spec = ANIMATIONS[Win.Style]
+	if not spec or not Win.Scale then
 		if not opening and not window.Minimized then
 			Win.OriginalMinimize(window)
 		end
-		Overlays.OnWindowToggled(opening)
 		return
 	end
 
@@ -2682,26 +3111,56 @@ function Win.Toggle(forceOpen: boolean?)
 	local base = Win.BaseScale
 	local rest = root.Position
 	local size = root.AbsoluteSize
-	local shrink = 0.92
-	local offset = UDim2_fromOffset(size.X * (1 - shrink) * 0.5, size.Y * (1 - shrink) * 0.5)
+	local scale = if opening then spec.OpenScale else spec.CloseScale
+	local shift = if opening then spec.OpenShift else spec.CloseShift
+	local offset = UDim2_fromOffset(size.X * (1 - scale) * 0.5, size.Y * (1 - scale) * 0.5 + shift)
+	local info = if opening then spec.Open else spec.Close
+	local tweens = Win.Tweens
 	Win.RestPosition = rest
+	local host = hostWindow()
 	if opening then
-		Win.Scale.Scale = base * shrink
+		Win.Scale.Scale = base * scale
 		root.Position = rest + offset
+		if host then
+			host.GroupTransparency = 1
+		end
 	end
-	local info = opening and TWEEN_OPEN or TWEEN_CLOSE
-	local scaleTween = TweenService:Create(Win.Scale, info, { Scale = opening and base or base * shrink })
-	local moveTween = TweenService:Create(root, info, { Position = opening and rest or rest + offset })
-	Win.Tweens[1] = scaleTween
-	Win.Tweens[2] = moveTween
-	scaleTween.Completed:Connect(function(state: Enum.PlaybackState)
+	if scale ~= 1 then
+		tweens[#tweens + 1] = TweenService:Create(Win.Scale, info, { Scale = if opening then base else base * scale })
+	end
+	if offset ~= ZERO_OFFSET then
+		tweens[#tweens + 1] = TweenService:Create(root, info, { Position = if opening then rest else rest + offset })
+	end
+	if host then
+		tweens[#tweens + 1] = TweenService:Create(
+			host,
+			if opening then FADE_IN else FADE_OUT,
+			{ GroupTransparency = if opening then 0 else 1 }
+		)
+	end
+	if #tweens == 0 then
+		Win.RestPosition = nil
+		unhostWindow()
+		if not opening and not window.Minimized then
+			Win.OriginalMinimize(window)
+		end
+		return
+	end
+	-- The longest tween ends the animation (snapping everything to its final state).
+	local driver = tweens[1]
+	for _, tween in ipairs(tweens) do
+		if tween.TweenInfo.Time > driver.TweenInfo.Time then
+			driver = tween
+		end
+	end
+	driver.Completed:Connect(function(state: Enum.PlaybackState)
 		if state == Enum.PlaybackState.Completed then
 			Win.FinishAnimation()
 		end
 	end)
-	scaleTween:Play()
-	moveTween:Play()
-	Overlays.OnWindowToggled(opening)
+	for _, tween in ipairs(tweens) do
+		tween:Play()
+	end
 end
 
 -- Re-runs Fluent's dialog sizing rules after the font multiplier enlarged the dialog's text.
@@ -2734,10 +3193,108 @@ function Win.RefitDialog(tint: Instance, config: any)
 	end
 end
 
+-- Player card (avatar + names) above the search bar ------------------------------------------
+local CARD_HEIGHT = 46
+Card.Enabled = true
+Card.Frame = nil :: Frame?
+
+function Win.CreatePlayerCard(window: any)
+	local userId = LocalPlayer.UserId
+	local ring = Util.Create("UIStroke", {
+		Thickness = 1.5,
+		Color = Palette.Accent,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+	local avatar = Util.Create("ImageLabel", {
+		Name = "Avatar",
+		BackgroundTransparency = 0.9,
+		Image = if userId > 0
+			then string_format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", userId)
+			else "",
+		Size = UDim2_fromOffset(32, 32),
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2_new(0, 8, 0.5, 0),
+	}, { Util.Create("UICorner", { CornerRadius = UDim_new(1, 0) }), ring })
+	local displayName = Util.Create("TextLabel", {
+		Name = "DisplayName",
+		BackgroundTransparency = 1,
+		Text = LocalPlayer.DisplayName,
+		FontFace = FONT_BOLD,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2_fromOffset(48, 7),
+		Size = UDim2_new(1, -56, 0, 16),
+	})
+	local userName = Util.Create("TextLabel", {
+		Name = "UserName",
+		BackgroundTransparency = 1,
+		Text = "@" .. LocalPlayer.Name,
+		FontFace = FONT_REGULAR,
+		TextSize = 11,
+		TextTransparency = 0.4,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2_fromOffset(48, 24),
+		Size = UDim2_new(1, -56, 0, 14),
+	})
+	local stroke = Util.Create("UIStroke", { Transparency = 0.82, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+	local frame = Util.Create("Frame", {
+		Name = "PlayerCard",
+		BackgroundTransparency = 0.94,
+		Position = UDim2_fromOffset(12, 52),
+		Size = UDim2_fromOffset(SETTINGS.TabWidth, CARD_HEIGHT),
+		Visible = Card.Enabled,
+		Parent = window.Root,
+	}, { Util.Corner(6), stroke, avatar, displayName, userName })
+	Card.Frame = frame
+	Win.Paint(function(palette)
+		frame.BackgroundColor3 = palette.Text
+		stroke.Color = palette.Text
+		avatar.BackgroundColor3 = palette.Text
+		displayName.TextColor3 = palette.Text
+		userName.TextColor3 = palette.Text
+	end)
+	Gradient.Add(ring, 3, true)
+	Tooltip.Attach(
+		frame,
+		string_format(
+			"%s (@%s)\nUserId %d · account age %d days",
+			LocalPlayer.DisplayName,
+			LocalPlayer.Name,
+			userId,
+			LocalPlayer.AccountAge
+		)
+	)
+end
+
+-- Card (optional) → search bar → tab list, top to bottom in the left column.
+function Win.LayoutSidebar()
+	local search, tabFrame = Win.SearchFrame, Win.TabFrame
+	if not search or not tabFrame then
+		return
+	end
+	local top = 52
+	local card = Card.Frame
+	if card then
+		card.Visible = Card.Enabled
+		if Card.Enabled then
+			top += CARD_HEIGHT + 8
+		end
+	end
+	search.Position = UDim2_fromOffset(12, top)
+	tabFrame.Position = UDim2_new(0, 12, 0, top + 40)
+	tabFrame.Size = UDim2_new(0, SETTINGS.TabWidth, 1, -(top + 52))
+end
+
+function Card.SetEnabled(enabled: boolean)
+	Card.Enabled = enabled == true
+	Win.LayoutSidebar()
+end
+
 function Win.CreateSearchBar(window: any, tabFrame: Frame)
 	local width = SETTINGS.TabWidth
-	tabFrame.Position = UDim2_new(0, 12, 0, 92)
-	tabFrame.Size = UDim2_new(0, width, 1, -104)
+	Win.TabFrame = tabFrame
 
 	local stroke = Util.Create("UIStroke", { Transparency = 0.82, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
 	local icon = Util.Create("ImageLabel", {
@@ -2779,6 +3336,7 @@ function Win.CreateSearchBar(window: any, tabFrame: Frame)
 		Size = UDim2_fromOffset(width, 32),
 		Parent = window.Root,
 	}, { Util.Corner(6), stroke, icon, box, count })
+	Win.SearchFrame = frame
 	Win.SearchBox = box
 	Win.SearchCount = count
 	Win.Paint(function(palette)
@@ -2812,6 +3370,15 @@ function Win.Create(): any
 	Win.UserScale = Config.Peek("UI_Scale", function(value)
 		return Util.IsFiniteNumber(value) and math_clamp(value, 0.75, 1.25) or nil
 	end) or 1
+	local function peekBoolean(id: string, default: boolean): boolean
+		local value = Config.Peek(id, function(raw)
+			return if type(raw) == "boolean" then raw else nil
+		end)
+		return if value == nil then default else value
+	end
+	Card.Enabled = peekBoolean("UI_PlayerCard", SETTINGS.PlayerCard ~= false)
+	Gradient.Enabled = peekBoolean("UI_MovingGradient", SETTINGS.MovingGradient ~= false)
+	Win.Style = Win.DefaultStyle()
 
 	local okKey, menuKey = pcall(function()
 		return (Enum.KeyCode :: any)[SETTINGS.MenuKey]
@@ -2846,7 +3413,29 @@ function Win.Create(): any
 	end
 
 	Background.Attach(window)
+
+	-- Moving gradient border, drawn over Fluent's own 1 px border.
+	local borderStroke = Util.Create("UIStroke", {
+		Thickness = 1.5,
+		Transparency = 0.1,
+		Color = WHITE,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+	local paint = window.AcrylicPaint
+	Gradient.Border = Util.Create("Frame", {
+		Name = "GradientBorder",
+		BackgroundTransparency = 1,
+		Size = UDim2_fromScale(1, 1),
+		ZIndex = 3,
+		Parent = if paint and paint.Frame then paint.Frame else root,
+	}, { Util.Corner(8), borderStroke })
+	Gradient.Add(borderStroke, 6, false)
+
+	Win.CreatePlayerCard(window)
 	Win.CreateSearchBar(window, tabFrame)
+	Win.LayoutSidebar()
+	Win.PaintAccent(paintGradients)
+	Gradient.Refresh()
 	ScaleFix.Canvas(window.TabHolder, 0)
 	if Win.Selector then
 		ScaleFix.Selector(Win.Selector)
@@ -3581,6 +4170,10 @@ Watermark.Enabled = false
 Watermark.Frame = nil :: Frame?
 Watermark.Label = nil :: TextLabel?
 Watermark.AccentHex = "60cdff"
+Watermark.Title = ""
+Watermark.Fps = 0
+Watermark.Ping = 0
+Watermark.Time = ""
 local WATERMARK_FORMAT = '<font color="#%s"><b>%s</b></font>  <font transparency="0.5">|</font>  %s'
 	.. '  <font transparency="0.5">|</font>  %d fps  <font transparency="0.5">|</font>  %d ms'
 	.. '  <font transparency="0.5">|</font>  %s'
@@ -3619,13 +4212,17 @@ function Watermark.Create(parent: Instance)
 		label,
 	})
 	Watermark.Frame, Watermark.Label = frame, label
+	Watermark.Title = escapeRichText(SETTINGS.Title)
 	Win.Paint(function(palette)
 		frame.BackgroundColor3 = palette.Panel
 		stroke.Color = palette.Text
 		label.TextColor3 = palette.Text
-		Watermark.AccentHex = palette.Accent:ToHex()
+	end)
+	-- Accent only re-renders the text with the cached readouts (cheap enough for the rainbow).
+	Win.PaintAccent(function(color: Color3)
+		Watermark.AccentHex = color:ToHex()
 		if Watermark.Enabled then
-			Watermark.Update()
+			Watermark.Render()
 		end
 	end)
 	Util.MakeDraggable(frame, frame, App.Maid, {
@@ -3635,7 +4232,7 @@ function Watermark.Create(parent: Instance)
 	})
 end
 
-function Watermark.Update()
+function Watermark.Render()
 	local label = Watermark.Label
 	if not label then
 		return
@@ -3643,12 +4240,20 @@ function Watermark.Update()
 	label.Text = string_format(
 		WATERMARK_FORMAT,
 		Watermark.AccentHex,
-		escapeRichText(SETTINGS.Title),
+		Watermark.Title,
 		LocalPlayer.Name,
-		math_floor(Perf.FPS() + 0.5),
-		math_floor(Perf.Ping() + 0.5),
-		os_date("%H:%M:%S")
+		Watermark.Fps,
+		Watermark.Ping,
+		Watermark.Time
 	)
+end
+
+-- 1 Hz: refresh the readouts, then render.
+function Watermark.Update()
+	Watermark.Fps = math_floor(Perf.FPS() + 0.5)
+	Watermark.Ping = math_floor(Perf.Ping() + 0.5)
+	Watermark.Time = os_date("%H:%M:%S")
+	Watermark.Render()
 end
 
 function Watermark.SetEnabled(enabled: boolean)
@@ -3743,11 +4348,18 @@ function KeybindList.Create(parent: Instance)
 	Win.Paint(function(palette)
 		frame.BackgroundColor3 = palette.Panel
 		stroke.Color = palette.Text
-		icon.ImageColor3 = palette.Accent
 		title.TextColor3 = palette.Text
 		empty.TextColor3 = palette.Text
 		if KeybindList.Enabled then
 			KeybindList.Refresh()
+		end
+	end)
+	Win.PaintAccent(function(color: Color3)
+		icon.ImageColor3 = color
+		for _, row in ipairs(KeybindList.Rows) do
+			if row.Frame.Visible and row.State.Text == "ON" then
+				row.State.TextColor3 = color
+			end
 		end
 	end)
 	Util.MakeDraggable(header, frame, App.Maid, {
@@ -3939,8 +4551,10 @@ function MobileButton.Create(parent: Instance)
 	MobileButton.Frame, MobileButton.Icon = button, icon
 	Win.Paint(function(palette)
 		button.BackgroundColor3 = palette.Panel
-		stroke.Color = palette.Accent
 		icon.ImageColor3 = palette.Text
+	end)
+	Win.PaintAccent(function(color: Color3)
+		stroke.Color = color
 	end)
 	Util.MakeDraggable(button, button, App.Maid, {
 		Threshold = 8,
@@ -4046,6 +4660,8 @@ end
 
 function Overlays.OnWindowToggled(open: boolean)
 	Tooltip.Hide()
+	Rainbow.Refresh() -- both pause while the window is hidden
+	Gradient.Refresh()
 	KeybindList.Refresh()
 	if MobileButton.Icon then
 		MobileButton.Icon.ImageTransparency = open and 0 or 0.3
@@ -4091,8 +4707,10 @@ local function BuildSettingsTab()
 		Default = SETTINGS.Theme,
 		Callback = function(theme: string?)
 			if theme then
-				fluent:SetTheme(theme)
-				Accent.Apply() -- re-applies a custom accent (if any) and repaints our own widgets
+				Fade.Run(function()
+					fluent:SetTheme(theme)
+					Accent.Apply() -- re-applies a custom accent (if any) and repaints our own widgets
+				end)
 			end
 		end,
 	})
@@ -4196,6 +4814,13 @@ local function BuildSettingsTab()
 		Default = SETTINGS.ShowKeybindList ~= false,
 		Callback = KeybindList.SetEnabled,
 	})
+	interface:Toggle("UI_PlayerCard", {
+		Title = "Player profile",
+		Description = "Your avatar and name above the search bar.",
+		Tooltip = "Only you can see it. Hover the card for your UserId and account age.",
+		Default = SETTINGS.PlayerCard ~= false,
+		Callback = Card.SetEnabled,
+	})
 	interface:Toggle("UI_MobileButton", {
 		Title = "Floating toggle button",
 		Description = IsTouch and "Touch device detected, so it is on by default." or "Handy on touch screens.",
@@ -4223,6 +4848,52 @@ local function BuildSettingsTab()
 		Callback = function(muted: boolean)
 			Notifier.Muted = muted
 		end,
+	})
+
+	-- Animations ------------------------------------------------------------------
+	local motion = tab:Section("Animations")
+	motion:Dropdown("UI_AnimationStyle", {
+		Title = "Open / close animation",
+		Description = "How the window appears and hides.",
+		Tooltip = "Zoom, Fade, Slide, Pop (bouncy) or None (lightest).",
+		Values = table_clone(ANIMATION_STYLES),
+		Default = Win.DefaultStyle(),
+		Callback = function(style: string?)
+			Win.SetStyle(style)
+		end,
+	})
+	motion:Toggle("UI_ThemeFade", {
+		Title = "Smooth theme fade",
+		Description = "Theme and accent changes fade instead of snapping.",
+		Tooltip = "Only runs while the colours change; nothing keeps running afterwards.",
+		Default = SETTINGS.ThemeFade ~= false,
+		Callback = function(enabled: boolean)
+			Fade.Enabled = enabled
+		end,
+	})
+	motion:Toggle("UI_MovingGradient", {
+		Title = "Moving gradient",
+		Description = "Animated accent gradient on the window border and profile ring.",
+		Tooltip = "A native looping tween (no per-frame Lua) that pauses while the window is hidden.",
+		Default = SETTINGS.MovingGradient ~= false,
+		Callback = Gradient.SetEnabled,
+	})
+	motion:Toggle("UI_RainbowAccent", {
+		Title = "Rainbow accent",
+		Description = "The accent colour cycles through the rainbow.",
+		Tooltip = "Recolours only accent parts, 20 times per second, and pauses while the window is hidden.",
+		Default = SETTINGS.RainbowAccent == true,
+		Callback = Rainbow.SetEnabled,
+	})
+	motion:Slider("UI_RainbowSpeed", {
+		Title = "Rainbow speed",
+		Description = "1 = slow (20 s per cycle), 10 = fast (2 s per cycle).",
+		Tooltip = "Used while the rainbow accent is on.",
+		Min = 1,
+		Max = 10,
+		Default = math_clamp(tonumber(SETTINGS.RainbowSpeed) or 3, 1, 10),
+		Rounding = 1,
+		Callback = Rainbow.SetSpeed,
 	})
 
 	-- Background ------------------------------------------------------------------
@@ -4525,15 +5196,6 @@ local function BuildSettingsTab()
 			Clock.Unsubscribe("SettingsTab")
 		end
 	end)
-	performance:Toggle("UI_Animations", {
-		Title = "Animations",
-		Description = "Open/close zoom animation.",
-		Tooltip = "Off gives the lightest possible UI.",
-		Default = true,
-		Callback = function(enabled: boolean)
-			App.AnimationsEnabled = enabled
-		end,
-	})
 	performance:Button({
 		Title = "Clear image cache",
 		Description = "Deletes downloaded background images.",
@@ -4642,6 +5304,8 @@ function App.Unload()
 	cancelThread(Clock.Thread)
 	cancelThread(Internals.PruneThread)
 	Config.SaveThread, Clock.Thread, Internals.PruneThread = nil, nil, nil
+	pcall(Fade.Stop)
+	Rainbow.Active = false
 	for index = #Win.Tweens, 1, -1 do
 		pcall(Win.Tweens[index].Destroy, Win.Tweens[index])
 		Win.Tweens[index] = nil
@@ -4688,12 +5352,16 @@ function App.Unload()
 	table_clear(Accent.Originals)
 	table_clear(Overlays.FrameMap)
 	table_clear(ScaleFix.Fixers)
+	table_clear(AccentPainters)
+	table_clear(Gradient.Items)
 	Config.Data = nil
 	Notifier.Create = nil
 	Internals.Creator, Internals.Themes, Accent.ThemeSets = nil, nil, nil
 	Background.Image, Background.StatusChanged = nil, NOOP
 	Win.Scale, Win.Selector, Win.SearchBox, Win.SearchCount = nil, nil, nil, nil
 	Win.OriginalMinimize, Win.OriginalMaximize = nil, nil
+	Win.SearchFrame, Win.TabFrame, Win.Host, Win.Hosted = nil, nil, nil, false
+	Card.Frame, Gradient.Border = nil, nil
 	Tooltip.Frame, Tooltip.Label, Watermark.Frame, Watermark.Label = nil, nil, nil, nil
 	KeybindList.Frame, KeybindList.Body, KeybindList.Empty = nil, nil, nil
 	MobileButton.Frame, MobileButton.Icon, Overlays.Gui = nil, nil, nil
@@ -4935,6 +5603,9 @@ function App.Finalize()
 			Watermark.SetEnabled(SETTINGS.ShowWatermark ~= false)
 			KeybindList.SetEnabled(SETTINGS.ShowKeybindList ~= false)
 			MobileButton.SetEnabled(IsTouch)
+			Fade.Enabled = SETTINGS.ThemeFade ~= false
+			Rainbow.SetSpeed(SETTINGS.RainbowSpeed)
+			Rainbow.SetEnabled(SETTINGS.RainbowAccent == true)
 		end
 	end)
 	Internals.EndBatch() -- one theme pass for everything built since CreateWindow

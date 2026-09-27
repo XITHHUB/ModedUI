@@ -2,7 +2,8 @@
 
 A batteries-included Roblox UI library built on [Fluent](https://github.com/dawid-scripts/Fluent) by dawid-scripts.
 You build tabs and elements like in Fluent; ModedUI saves every element automatically and adds profiles,
-autosave, a URL background, search, overlays, rate-limited notifications and a full Settings tab.
+autosave, a player profile card, animations, a URL background, search, overlays, rate-limited
+notifications and a full Settings tab.
 
 ```lua
 local ModedUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/ModedUI.lua"))()
@@ -37,7 +38,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/
 | --- | --- |
 | `ModedUI.lua` | The library |
 | `Example.lua` | Example hub: a Main tab with every element type and an API tab |
-| `Standalone/FluentModded.lua` | The original all-in-one script (no library, runs on its own) |
+| `Standalone/FluentModded.lua` | The original all-in-one script from v1.0 (runs on its own; no profile card or new animations) |
 
 ## Features
 
@@ -45,13 +46,14 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/
 - **Autosave**: on/off and delay (0.5–10 s) in Settings → Config, stored in the file header. Writes only when something changed; a slider drag causes one write, not hundreds.
 - **Safety**: a corrupt file is backed up to `.bak` and defaults are loaded; the format is versioned with migrations; bad values are rejected per element.
 - **Background**: image from a URL, downloaded once and cached (`writefile` + `getcustomasset`), optional `rbxassetid` fallback, transparency/dim/visibility controls.
-- **Window**: menu key (RightControl by default), floating toggle button + auto-fit on mobile, remembered position and size, search across all tabs (Ctrl+F), open/close animation, Lucide tab icons.
+- **Window**: player profile card (avatar, display name, @username) above the search bar, menu key (RightControl by default), floating toggle button + auto-fit on mobile, remembered position and size, search across all tabs (Ctrl+F), Lucide tab icons.
+- **Animations**: open/close styles (Zoom, Fade, Slide, Pop or None), smooth fade when the theme or accent changes, a moving gradient on the window border and the profile ring, and a rainbow accent with a speed slider.
 - **Appearance**: theme, live accent colour, UI scale 0.75–1.25, font size (Small/Normal/Large), acrylic blur toggle (off by default).
 - **Notifications**: Info/Success/Warning/Error icons, never more than 3 on screen, mute switch.
 - **Overlays**: watermark (refreshed once per second), draggable keybind list, Info tab (game, server, session, changelog).
 - **Elements**: tooltips, search keywords, searchable dropdowns (more than 10 options) with `:Refresh(values)`, numeric inputs with Min/Max, every callback wrapped in `pcall` (errors become Error toasts).
-- **Settings tab**: Interface, Background, Config and Performance (Rejoin, Copy JobId, Reload UI, Unload).
-- **Performance**: the whole build is themed in one pass, services and globals are cached, nothing runs per frame, one timer for autosave, everything is cleaned up by a Maid, and executing the script twice replaces the old window.
+- **Settings tab**: Interface, Animations, Background, Config and Performance (Rejoin, Copy JobId, Reload UI, Unload).
+- **Performance**: the whole build is themed in one pass, services and globals are cached, one timer for autosave, everything is cleaned up by a Maid, and executing the script twice replaces the old window. The moving gradient and window animations are native tweens; the rainbow accent recolours only accent parts 20 times per second; both pause while the window is hidden, and the theme fade only runs while colours change.
 
 ## CreateWindow options
 
@@ -76,6 +78,12 @@ Every option is optional.
 | `SettingsTab` | `true` | Add the Settings tab |
 | `ShowWatermark` | `true` | Watermark default |
 | `ShowKeybindList` | `true` | Keybind list default |
+| `PlayerCard` | `true` | Player profile card above the search bar |
+| `AnimationStyle` | `"Zoom"` | Open/close animation: `"Zoom"`, `"Fade"`, `"Slide"`, `"Pop"` or `"None"` |
+| `ThemeFade` | `true` | Fade theme and accent changes instead of snapping |
+| `MovingGradient` | `true` | Animated gradient on the window border and profile ring |
+| `RainbowAccent` | `false` | Accent colour cycles through the rainbow |
+| `RainbowSpeed` | `3` | 1 (20 s per cycle) to 10 (2 s per cycle) |
 | `WelcomeToast` | `true` | "Loaded in 0.07s" toast |
 | `Changelog` | `{ "v1.0.0", "• First release" }` | Lines shown in the Info tab |
 | `Reload` | your script | Function that Reload UI runs; defaults to the script that called `CreateWindow` |
@@ -143,6 +151,14 @@ Window.Fluent, Window.FluentWindow, Window.Version
 The Info and Settings tabs, the saved window position and the welcome toast are added right after your
 script finishes building (or first yields). Tabs you add later still work and still sort above Info and
 Settings; call `Window:Finalize()` yourself if you want that step to happen at a specific point.
+
+The built-in settings are elements too, so your script can read or change them through `Window.Options`:
+
+```lua
+Window.Options.UI_AnimationStyle:SetValue("Pop")
+Window.Options.UI_RainbowAccent:SetValue(true)
+Window.Options.UI_Theme:SetValue("Rose")
+```
 
 Calling `ModedUI:CreateWindow` again creates another independent window (give it a different `Folder`).
 Every window has its own watermark and keybind list, so turn those off on extra windows with

@@ -447,6 +447,49 @@ Dialogs:Button({
 	end,
 })
 
+-- Built-in settings are elements too, so code can drive them through Options.UI_*.
+local Looks = Api:Section("Look & feel")
+local STYLES = { "Zoom", "Fade", "Slide", "Pop", "None" }
+
+Looks:Button({
+	Title = "Try the next animation style",
+	Description = "Options.UI_AnimationStyle:SetValue(style), then closes and reopens the window.",
+	Tooltip = "Same setting as Settings → Animations → Open / close animation.",
+	Callback = function()
+		local option = Options.UI_AnimationStyle
+		local style = STYLES[(table.find(STYLES, option.Value) or 0) % #STYLES + 1]
+		option:SetValue(style)
+		Window:Notify("Animation style", style, 2, "Info")
+		Window:Toggle(false)
+		task.delay(0.6, function()
+			if Window:IsReady() then
+				Window:Toggle(true)
+			end
+		end)
+	end,
+})
+
+Looks:Button({
+	Title = "Next theme",
+	Description = "Cycles Options.UI_Theme; watch the smooth fade.",
+	Tooltip = "Turn the fade off in Settings → Animations → Smooth theme fade.",
+	Callback = function()
+		local option = Options.UI_Theme
+		local themes = option.Values
+		option:SetValue(themes[(table.find(themes, option.Value) or 0) % #themes + 1])
+	end,
+})
+
+Looks:Button({
+	Title = "Toggle rainbow accent",
+	Description = "Options.UI_RainbowAccent:SetValue(not Options.UI_RainbowAccent.Value)",
+	Tooltip = "Speed is in Settings → Animations → Rainbow speed.",
+	Callback = function()
+		local option = Options.UI_RainbowAccent
+		option:SetValue(not option.Value)
+	end,
+})
+
 local ConfigApi = Api:Section("Config")
 
 local configInfo = ConfigApi:Paragraph({ -- no id: not saved
