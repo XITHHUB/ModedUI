@@ -45,7 +45,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/XITHHUB/ModedUI/main/
 - **Config**: one JSON file per player (`<Folder>/<PlayerName>.json`) holding all profiles. Create, duplicate, rename, delete and reset profiles; export/import JSON with validation; confirm dialogs for destructive actions.
 - **Autosave**: on/off and delay (0.5–10 s) in Settings → Config, stored in the file header. Writes only when something changed; a slider drag causes one write, not hundreds.
 - **Safety**: a corrupt file is backed up to `.bak` and defaults are loaded; the format is versioned with migrations; bad values are rejected per element.
-- **Background**: image from a URL, downloaded once and cached (`writefile` + `getcustomasset`), optional `rbxassetid` fallback, transparency/dim/visibility controls.
+- **Images**: background image and a title bar logo from a link, downloaded once and cached (`writefile` + `getcustomasset`). Discord links, WebP/GIF/AVIF (converted to PNG), GitHub and imgur pages all work; optional `rbxassetid` fallback; transparency/dim/visibility controls for the background.
 - **Window**: player profile card (avatar, display name, @username) above the search bar, menu key (RightControl by default), floating toggle button + auto-fit on mobile, remembered position and size, search across all tabs (Ctrl+F), Lucide tab icons.
 - **Animations**: open/close styles (Zoom, Fade, Slide, Pop or None), smooth fade when the theme or accent changes, a moving gradient on the window border and the profile ring, and a rainbow accent with a speed slider.
 - **Appearance**: theme, live accent colour, UI scale 0.75–1.25, font size (Small/Normal/Large), acrylic blur toggle (off by default).
@@ -67,7 +67,9 @@ Every option is optional.
 | `SubTitle` | `"v" .. Version` | Text next to the title |
 | `Version` | `"1.0.0"` | Your hub's version, shown in the Info tab |
 | `Folder` | `"ModedUI"` | Config folder in the executor workspace (letters, digits, `-`, `_`). It also identifies the window, so give every hub its own |
-| `BackgroundUrl` | `""` | Default background image (direct PNG/JPG link) |
+| `BackgroundUrl` | `""` | Default background image (image link, Discord link or asset id) |
+| `Logo` | `""` | Image in front of the window title (image link, Discord link or asset id) |
+| `ImageConverter` | `"https://wsrv.nl/?url=%s&output=png"` | Converts WebP/GIF/AVIF… to PNG (`false` = never) |
 | `FallbackAssetId` | `""` | `rbxassetid` (digits only) used when the URL can't be loaded |
 | `Theme` | `"Dark"` | Default theme |
 | `MenuKey` | `"RightControl"` | Default menu key (name or `Enum.KeyCode`) |
@@ -140,6 +142,7 @@ Window:OnUnload(callback)                        -- undo what your script change
 Window:RefreshDropdown(id, values)
 Window:RefreshKeybinds()                         -- after changing a keybind's Toggled state yourself
 Window:SetBackground(url)
+Window:SetLogo(url)                              -- "" removes it
 Window:Toggle(open)                              -- true = open, false = close, nil = flip
 Window:IsReady()                                 -- false while building and after unload
 Window:Finalize()                                -- optional, see below
@@ -170,6 +173,26 @@ Window.Options.UI_Theme:SetValue("Rose")
 Calling `ModedUI:CreateWindow` again creates another independent window (give it a different `Folder`).
 Every window has its own watermark and keybind list, so turn those off on extra windows with
 `ShowWatermark = false` and `ShowKeybindList = false` if one set is enough.
+
+## Images (background and logo)
+
+```lua
+local Window = ModedUI:CreateWindow({
+	Title = "My Hub",
+	Logo = "https://raw.githubusercontent.com/you/repo/main/logo.png", -- 20 px, in front of the title
+	BackgroundUrl = "https://i.imgur.com/abc123.webp",
+})
+Window:SetLogo("rbxassetid://1234567890") -- change it later ("" removes it)
+```
+
+Accepted: direct image links (PNG and JPG load directly; WebP, GIF, AVIF, BMP and SVG are converted to PNG
+through `ImageConverter`), Discord attachment links, GitHub `blob` pages, `imgur.com/<id>` pages, Dropbox
+links, `rbxassetid://…` and plain asset ids. Every image is downloaded once and loaded from
+`<Folder>/cache` after that.
+
+Discord links stop working after about a day. A logo or background that already loaded keeps working
+from the cache on that PC, but for a script you share, put the image somewhere permanent (for example
+your GitHub repo) and use that link.
 
 ## Hide and lock
 
@@ -258,7 +281,7 @@ ModedUI feature-detects every optional function once and falls back safely:
 | Function | Used for | Without it |
 | --- | --- | --- |
 | `writefile`, `readfile`, `isfile`, `isfolder`, `makefolder` | Config file | Settings work but only live in memory (a warning toast says so) |
-| `getcustomasset` | URL background | `FallbackAssetId` is used, or no image |
+| `getcustomasset` | Background and logo from links | `FallbackAssetId` / asset ids still work; links don't |
 | `listfiles`, `delfile` | Clearing the image cache | The Clear cache button reports it is unavailable |
 | `setclipboard` | Copy JobId, Export | The text is shown in a toast or printed to the console (F9) |
 | `getgenv` | Double-load guard, Fluent cache | `_G` is used |

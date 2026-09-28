@@ -20,6 +20,7 @@ local Window = ModedUI:CreateWindow({
 	Title = "ModedUI Example",
 	Version = "1.0.0",
 	Folder = "ModedUIExample", -- config file: ModedUIExample/<YourName>.json
+	-- Logo = "https://…/logo.png", -- image in front of the title (image link, Discord link or asset id)
 	Changelog = { "v1.0.0", "• Example hub for ModedUI" },
 })
 local Options = Window.Options -- every element by id, e.g. Options.FieldOfView.Value

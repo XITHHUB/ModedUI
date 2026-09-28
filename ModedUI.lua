@@ -1,5 +1,5 @@
 --[[
-	ModedUI  ·  v1.3.0
+	ModedUI  ·  v1.4.0
 	A batteries-included UI library built on Fluent by dawid-scripts
 	https://github.com/XITHHUB/ModedUI  ·  Fluent: https://github.com/dawid-scripts/Fluent
 
@@ -9,7 +9,8 @@
 	Main:Section("Combat"):Toggle("AutoParry", { Title = "Auto parry", Default = false, Callback = print })
 
 	Features
-	  • Background image from a URL (downloaded once, cached to disk, loaded with getcustomasset)
+	  • Background image and title bar logo from a URL (downloaded once, cached to disk, loaded with
+	    getcustomasset); Discord links, WebP/GIF/AVIF (converted to PNG) and GitHub/imgur pages work
 	  • Per-player JSON config: profiles, autosave (on/off + delay), import/export, corrupt-file backup
 	  • Player profile card, search across all tabs, mobile toggle button + auto-fit, UI scale
 	  • Theme / accent / font size / acrylic controls, all saved per profile
@@ -27,7 +28,7 @@
 	  6. Window     7. Tabs        8. Overlays         9. Settings       10. Init (public API)
 ]]
 
-local LIBRARY_VERSION = "1.3.0"
+local LIBRARY_VERSION = "1.4.0"
 local LIBRARY_CHUNK = debug.info(1, "f") -- lets each additional window run on a fresh library copy
 local CONFIG_VERSION = 2 -- saved file format (see MIGRATIONS in section 4)
 
@@ -39,7 +40,10 @@ local DEFAULTS = {
 	SubTitle = nil :: string?, -- defaults to "v" .. Version
 	Version = "1.0.0", -- your hub's version (shown in the Info tab)
 	Folder = "ModedUI", -- config folder inside the executor workspace
-	BackgroundUrl = "", -- default background image (direct PNG/JPG link). "" = none
+	BackgroundUrl = "", -- default background image (image link, Discord link or asset id). "" = none
+	Logo = "", -- image in front of the window title (image link, Discord link or asset id)
+	-- Converts WebP/GIF/AVIF… to PNG (%s = the encoded image link). false = never convert.
+	ImageConverter = "https://wsrv.nl/?url=%s&output=png" :: string | boolean,
 	FallbackAssetId = "", -- optional rbxassetid (digits only) used when the URL can't be loaded
 	Theme = "Dark",
 	MenuKey = "RightControl",
@@ -194,6 +198,8 @@ local Card: any = {}
 local Rainbow: any = {}
 local Gradient: any = {}
 local Fade: any = {}
+local Images: any = {}
+local Logo: any = {}
 
 --══════════════════════════════════════════════════════════════════════════════
 -- 2. UTILITIES
@@ -1809,12 +1815,10 @@ function Config.Import(text: any)
 end
 
 --══════════════════════════════════════════════════════════════════════════════
--- 5. BACKGROUND
+-- 5. BACKGROUND, IMAGES & LOGO
 --══════════════════════════════════════════════════════════════════════════════
--- URL → cached file (<Folder>/cache/bg_<hash>.png|jpg) → getcustomasset → ImageLabel.
--- The cache key is a hash of the URL, so every URL is downloaded exactly once per machine and
--- changing the URL never shows a stale image. Without writefile/getcustomasset the optional
--- rbxassetid fallback is used instead.
+-- Image link → Images.Resolve (below: download once, cache, convert when needed) → ImageLabel.
+-- Without writefile/getcustomasset the optional rbxassetid fallback is used instead.
 Background.Image = nil :: ImageLabel?
 Background.Url = ""
 Background.Enabled = true
@@ -1825,7 +1829,250 @@ Background.Status = "No image set"
 Background.Token = 0 -- bumps on every load; stale downloads compare it and discard their result
 Background.StatusChanged = NOOP :: (string) -> ()
 
-local IMAGE_EXTENSIONS = { "png", "jpg" }
+-- Images ----------------------------------------------------------------------------------------
+-- Every custom image (background, title bar logo) goes through Images.Resolve:
+--   rbxassetid://123, rbxthumb://…, plain asset ids → used directly (no download)
+--   http(s) links → downloaded once, cached as <Folder>/cache/img_<hash>.png|jpg → getcustomasset
+-- Roblox can only load PNG and JPG, so links are normalised first and other formats converted:
+--   • Discord (cdn.discordapp.com / media.discordapp.net): asks Discord's media proxy for PNG and
+--     caches by attachment path, so the image keeps working from the cache after the signed link
+--     expires. Expired links can't be downloaded again, so host images you share elsewhere.
+--   • GitHub "blob" pages → raw.githubusercontent.com, imgur.com/<id> → i.imgur.com/<id>.png,
+--     Dropbox dl=0 → raw=1.
+--   • WebP, GIF, AVIF, BMP, SVG… → converted to PNG through the ImageConverter option
+--     (default: the free wsrv.nl image proxy; set ImageConverter = false to never use it).
+local CACHE_EXTENSIONS = { "png", "jpg" }
+
+-- "png" / "jpg" (Roblox can load these) or the name of another image format, else nil.
+function Util.ImageKind(data: any): string?
+	if type(data) ~= "string" or #data < 12 then
+		return nil
+	end
+	local head = string_sub(data, 1, 12)
+	if string_sub(head, 1, 8) == "\137PNG\r\n\26\n" then
+		return "png"
+	elseif string_sub(head, 1, 3) == "\255\216\255" then
+		return "jpg"
+	elseif string_sub(head, 1, 4) == "RIFF" and string_sub(head, 9, 12) == "WEBP" then
+		return "webp"
+	elseif string_sub(head, 1, 4) == "GIF8" then
+		return "gif"
+	elseif string_sub(head, 1, 2) == "BM" then
+		return "bmp"
+	elseif string_sub(head, 5, 8) == "ftyp" then
+		return "avif"
+	elseif string_find(string_lower(string_sub(data, 1, 512)), "<svg", 1, true) then
+		return "svg"
+	end
+	return nil
+end
+
+local function describeBody(data: string): string
+	local lower = string_lower(string_sub(data, 1, 2048))
+	if string_find(lower, "no longer available", 1, true) then
+		return "the link has expired"
+	elseif string_find(lower, "<html", 1, true) or string_find(lower, "<!doctype", 1, true) then
+		return "the link opens a web page, not an image (use the direct image link)"
+	end
+	return "the link did not return an image"
+end
+
+local function queryParams(query: string): { [string]: string }
+	local params = {}
+	for key, value in string.gmatch(query, "([^&=?]+)=([^&]*)") do
+		params[key] = value
+	end
+	return params
+end
+
+-- Returns the URLs to try (in order) and the cache key for a link.
+function Images.Candidates(url: string): ({ string }, string)
+	local candidates = {}
+	local key = url
+	local host = string_lower(string_match(url, "^https?://([^/?#]+)") or "")
+	local path = string_match(url, "^https?://[^/?#]+([^?#]*)") or ""
+	local params = queryParams(string_match(url, "%?([^#]*)") or "")
+
+	if (host == "cdn.discordapp.com" or host == "media.discordapp.net") and string_find(path, "^/attachments/") then
+		key = "discord:" .. path -- stable across re-signed links
+		local signature = {}
+		for _, name in ipairs({ "ex", "is", "hm" }) do
+			if params[name] and params[name] ~= "" then
+				signature[#signature + 1] = name .. "=" .. params[name]
+			end
+		end
+		local signed = table_concat(signature, "&")
+		local sized = signed
+		if params.width and params.height then
+			sized = string_format("%s&width=%s&height=%s", signed, params.width, params.height)
+		end
+		candidates[1] = string_format("https://media.discordapp.net%s?%s&format=png", path, sized)
+		candidates[2] = string_format("https://cdn.discordapp.com%s?%s", path, signed)
+	else
+		local owner, repo, rest = string_match(url, "^https?://github%.com/([^/]+)/([^/]+)/blob/(.+)$")
+		local imgur = string_match(url, "^https?://imgur%.com/(%w+)$")
+		if owner then
+			candidates[1] = string_format("https://raw.githubusercontent.com/%s/%s/%s", owner, repo, rest)
+		elseif imgur then
+			candidates[1] = string_format("https://i.imgur.com/%s.png", imgur)
+		elseif host == "www.dropbox.com" or host == "dropbox.com" then
+			candidates[1] = (string_gsub(url, "dl=0", "raw=1"))
+		else
+			candidates[1] = url
+		end
+	end
+
+	local converter = SETTINGS.ImageConverter
+	if type(converter) == "string" and string_find(converter, "%%s") then
+		candidates[#candidates + 1] = string_format(converter, HttpService:UrlEncode(url))
+	end
+	return candidates, key
+end
+
+local function cachePath(key: string, extension: string): string
+	return string_format("%s/img_%s.%s", Config.CacheFolder, Util.Hash(key), extension)
+end
+
+-- Resolves an image source to a content id. Yields while downloading: call it from a thread.
+function Images.Resolve(source: any): (string?, string)
+	local text = Util.Trim(tostring(source or ""))
+	if text == "" then
+		return nil, "No image set"
+	end
+	local digits = string_match(text, "^rbxassetid://(%d+)$") or string_match(text, "^(%d+)$")
+	if digits then
+		return "rbxassetid://" .. digits, "Roblox asset"
+	end
+	if string_find(text, "^rbxthumb://") or string_find(text, "^rbxasset://") then
+		return text, "Roblox content"
+	end
+	if not string_find(text, "^https?://") then
+		return nil, "Use an http(s) image link, rbxassetid://… or an asset id"
+	end
+	if not Env.CanUseAssets then
+		return nil, "This executor has no writefile/getcustomasset"
+	end
+
+	local candidates, key = Images.Candidates(text)
+	local path, how = nil, "Loaded from cache"
+	for _, extension in ipairs(CACHE_EXTENSIONS) do
+		local candidate = cachePath(key, extension)
+		local ok, exists = pcall(Env.isfile, candidate)
+		if ok and exists then
+			path = candidate
+			break
+		end
+	end
+
+	if not path then
+		local problem = "no response"
+		for index, candidate in ipairs(candidates) do
+			local ok, data = pcall(function()
+				return (game :: any):HttpGet(candidate)
+			end)
+			if ok and type(data) == "string" then
+				local kind = Util.ImageKind(data)
+				if kind == "png" or kind == "jpg" then
+					Config.EnsureFolder(Config.Folder)
+					Config.EnsureFolder(Config.CacheFolder)
+					local target = cachePath(key, kind)
+					local written, err = pcall(Env.writefile, target, data)
+					if not written then
+						return nil, "Could not cache the image: " .. CleanError(err)
+					end
+					path = target
+					how = if index == #candidates and #candidates > 1
+						then "Downloaded (converted to PNG) and cached"
+						else "Downloaded and cached"
+					break
+				end
+				problem = if kind then string_format("got a %s image", string.upper(kind)) else describeBody(data)
+			else
+				problem = CleanError(data)
+			end
+		end
+		if not path then
+			if string_find(key, "^discord:") then
+				problem ..= " (Discord links expire after about a day: copy a fresh link, or host the image on GitHub)"
+			end
+			return nil, "Couldn't load the image: " .. problem
+		end
+	end
+
+	local ok, contentId = pcall(Env.getcustomasset, path)
+	if not ok or type(contentId) ~= "string" or contentId == "" then
+		return nil, "getcustomasset failed for the cached file"
+	end
+	return contentId, how
+end
+
+-- Title bar logo -----------------------------------------------------------------------------------
+-- A 20 px image in front of the window title (Logo option / Window:SetLogo). Hidden until loaded.
+Logo.Holder = nil :: Frame?
+Logo.Image = nil :: ImageLabel?
+Logo.Token = 0
+
+function Logo.Attach(window: any)
+	local bar = window.TitleBar and window.TitleBar.Frame
+	if not bar then
+		return
+	end
+	local row: Instance? = nil
+	for _, child in ipairs(bar:GetChildren()) do
+		if child:IsA("Frame") and child:FindFirstChildOfClass("UIListLayout") then
+			row = child
+			break
+		end
+	end
+	if not row then
+		return
+	end
+	local image = Util.Create("ImageLabel", {
+		Name = "Image",
+		BackgroundTransparency = 1,
+		ScaleType = Enum.ScaleType.Fit,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2_fromScale(0.5, 0.5),
+		Size = UDim2_fromOffset(20, 20),
+		Image = "",
+	}, { Util.Corner(4) })
+	Logo.Image = image
+	Logo.Holder = Util.Create("Frame", {
+		Name = "Logo",
+		BackgroundTransparency = 1,
+		Size = UDim2_new(0, 22, 1, 0),
+		LayoutOrder = -1, -- before the title (Fluent's row sorts by LayoutOrder)
+		Visible = false,
+		Parent = row,
+	}, { image })
+end
+
+function Logo.Set(source: any)
+	Logo.Token += 1
+	local token = Logo.Token
+	local holder, image = Logo.Holder, Logo.Image
+	if not holder or not image then
+		return
+	end
+	if Util.Trim(tostring(source or "")) == "" then
+		holder.Visible = false
+		image.Image = ""
+		return
+	end
+	task_spawn(function()
+		local contentId, status = Images.Resolve(source)
+		if token ~= Logo.Token or App.Unloaded or not Logo.Image then
+			return
+		end
+		if contentId then
+			image.Image = contentId
+			holder.Visible = true
+		else
+			holder.Visible = false
+			Notify("Logo", status, 8, "Warning")
+		end
+	end)
+end
 
 -- Image layer inside Fluent's window paint: above the acrylic tint, below the window border and
 -- every element (they are later siblings of the paint frame), clipped with the window's 8px radius.
@@ -1867,53 +2114,9 @@ local function setBackgroundStatus(text: string)
 	SafeCall("Background", Background.StatusChanged, text)
 end
 
-local function backgroundCachePath(url: string, extension: string): string
-	return string_format("%s/bg_%s.%s", Config.CacheFolder, Util.Hash(url), extension)
-end
-
--- Yields (HttpGet), so it is only ever called from its own thread.
+-- Yields (downloads), so it is only ever called from its own thread.
 function Background.Resolve(url: string): (string?, string)
-	if not string_find(url, "^https?://") then
-		return nil, "The URL must start with http:// or https://"
-	end
-	if not Env.CanUseAssets then
-		return nil, "This executor has no writefile/getcustomasset"
-	end
-	local path = nil
-	for _, extension in ipairs(IMAGE_EXTENSIONS) do
-		local candidate = backgroundCachePath(url, extension)
-		local ok, exists = pcall(Env.isfile, candidate)
-		if ok and exists then
-			path = candidate
-			break
-		end
-	end
-	local source = "Loaded from cache"
-	if not path then
-		local ok, data = pcall(function()
-			return (game :: any):HttpGet(url)
-		end)
-		if not ok then
-			return nil, "Download failed: " .. CleanError(data)
-		end
-		local extension = Util.DetectImage(data)
-		if not extension then
-			return nil, "That URL did not return a PNG or JPG image"
-		end
-		Config.EnsureFolder(Config.Folder)
-		Config.EnsureFolder(Config.CacheFolder)
-		path = backgroundCachePath(url, extension)
-		local written, err = pcall(Env.writefile, path, data)
-		if not written then
-			return nil, "Could not cache the image: " .. CleanError(err)
-		end
-		source = "Downloaded and cached"
-	end
-	local ok, contentId = pcall(Env.getcustomasset, path)
-	if not ok or type(contentId) ~= "string" or contentId == "" then
-		return nil, "getcustomasset failed for the cached file"
-	end
-	return contentId, source
+	return Images.Resolve(url)
 end
 
 -- Loads (or clears) the background without blocking the UI. In-flight downloads are never
@@ -1977,7 +2180,9 @@ function Background.ClearCache(): number
 	end
 	local removed = 0
 	for _, file in ipairs(files) do
-		if type(file) == "string" and string_find(file, "bg_%x+%.%a+$") and pcall(Env.delfile, file) then
+		local cached = type(file) == "string"
+			and (string_find(file, "img_%x+%.%a+$") ~= nil or string_find(file, "bg_%x+%.%a+$") ~= nil)
+		if cached and pcall(Env.delfile, file) then
 			removed += 1
 		end
 	end
@@ -3058,6 +3263,24 @@ local function hostWindow(): CanvasGroup?
 	return canvas
 end
 
+-- Fluent's dropdown lists and toasts are siblings of the window root in its ScreenGui, all with
+-- ZIndex 1, so their drawing order falls back to parenting order. Moving the root for an
+-- animation would put the window over them (dropdown lists opening *behind* the window after the
+-- first close/open), so everything except the window gets an explicit higher ZIndex.
+local SIBLING_Z = 10
+
+function Win.RaiseSiblings()
+	local window, fluent = App.Window, App.Fluent
+	if not window or not fluent then
+		return
+	end
+	for _, child in ipairs(fluent.GUI:GetChildren()) do
+		if child ~= window.Root and child ~= Win.Host and child:IsA("GuiObject") and child.ZIndex < SIBLING_Z then
+			child.ZIndex = SIBLING_Z
+		end
+	end
+end
+
 local function unhostWindow()
 	if not Win.Hosted then
 		return
@@ -3065,6 +3288,7 @@ local function unhostWindow()
 	Win.Hosted = false
 	if App.Window and App.Fluent then
 		moveRoot(App.Fluent.GUI)
+		Win.RaiseSiblings()
 	end
 	local host = Win.Host
 	if host then
@@ -3111,6 +3335,9 @@ function Win.Toggle(forceOpen: boolean?)
 	Win.Open = opening
 	if opening and window.Minimized then
 		Win.OriginalMinimize(window) -- Fluent shows the root (and its one-time key hint)
+	end
+	if not opening then
+		UI.CloseDropdowns() -- their lists live outside the window and would stay on screen
 	end
 	Tooltip.Hide()
 	Overlays.OnWindowToggled(opening)
@@ -3446,9 +3673,12 @@ function Win.Create(): any
 	}, { Util.Corner(8), borderStroke })
 	Gradient.Add(borderStroke, 6, false)
 
+	Logo.Attach(window)
+	Logo.Set(SETTINGS.Logo)
 	Win.CreatePlayerCard(window)
 	Win.CreateSearchBar(window, tabFrame)
 	Win.LayoutSidebar()
+	Win.RaiseSiblings()
 	Win.PaintAccent(paintGradients)
 	Gradient.Refresh()
 	ScaleFix.Canvas(window.TabHolder, 0)
@@ -3981,12 +4211,26 @@ function Internals.ResolveTabModule(): any
 	return module or nil
 end
 
+-- Closes every open dropdown list (they float outside the window).
+function UI.CloseDropdowns()
+	local fluent = App.Fluent
+	if not fluent then
+		return
+	end
+	for _, option in pairs(fluent.Options) do
+		if type(option) == "table" and option.Type == "Dropdown" and option.Opened and type(option.Close) == "function" then
+			pcall(option.Close, option)
+		end
+	end
+end
+
 -- Selects a tab (Fluent's own Window:SelectTab always picks the first one).
 function UI.SelectTab(builder: any): boolean
 	local tab = builder and builder.Fluent
 	if not tab or not tab.Frame then
 		return false
 	end
+	UI.CloseDropdowns()
 	local module = Internals.ResolveTabModule()
 	if module then
 		for index, candidate in pairs(module.Tabs) do
@@ -4138,6 +4382,9 @@ local function setTabHidden(builder: any, hidden: boolean)
 		return
 	end
 	record.Hidden = hidden
+	if hidden then
+		UI.CloseDropdowns()
+	end
 	local frame = builder.Fluent.Frame
 	if frame then
 		frame.Visible = not hidden
@@ -4179,6 +4426,9 @@ end
 function Builder:SetLocked(locked: boolean, reason: string?): any
 	local record = if self.IsTab then self.TabRecord else self.SectionRecord
 	record.Locked = locked ~= false
+	if record.Locked then
+		UI.CloseDropdowns()
+	end
 	record.Reason = if record.Locked and reason ~= nil then tostring(reason) else nil
 	if self.IsTab then
 		refreshTabLock(self)
@@ -4406,6 +4656,9 @@ function UI.PatchDropdown(entry: any)
 		end
 	end
 
+	if canvas then
+		canvas.ZIndex = 10 -- above the window root (see Win.RaiseSiblings)
+	end
 	local build = option.BuildDropdownList
 	option.BuildDropdownList = function(self)
 		Internals.Batch(function()
@@ -5583,7 +5836,7 @@ local function BuildSettingsTab()
 	})
 	background:Input("UI_BackgroundUrl", {
 		Title = "Image URL",
-		Description = "Direct PNG/JPG link. Downloaded once, then loaded from the cache.",
+		Description = "PNG, JPG, WebP, GIF, Discord, imgur or GitHub link. Downloaded once, then cached.",
 		Tooltip = "Press Enter or click away to load it.",
 		Placeholder = "https://…/image.png",
 		Default = SETTINGS.BackgroundUrl,
@@ -6012,6 +6265,8 @@ function App.Unload()
 	Win.OriginalMinimize, Win.OriginalMaximize = nil, nil
 	Win.SearchFrame, Win.TabFrame, Win.Host, Win.Hosted = nil, nil, nil, false
 	Card.Frame, Gradient.Border = nil, nil
+	Logo.Holder, Logo.Image = nil, nil
+	Logo.Token += 1
 	Tooltip.Frame, Tooltip.Label, Watermark.Frame, Watermark.Label = nil, nil, nil, nil
 	KeybindList.Frame, KeybindList.Body, KeybindList.Empty = nil, nil, nil
 	MobileButton.Frame, MobileButton.Icon, Overlays.Gui = nil, nil, nil
@@ -6237,6 +6492,11 @@ local function CreatePublic(): any
 	function public:RefreshKeybinds()
 		KeybindList.RebuildHoldMap()
 		KeybindList.Refresh()
+	end
+
+	-- Image in front of the window title: an image link, a Discord link or an asset id ("" = none).
+	function public:SetLogo(source: string?)
+		Logo.Set(source)
 	end
 
 	function public:SetBackground(url: string?)
